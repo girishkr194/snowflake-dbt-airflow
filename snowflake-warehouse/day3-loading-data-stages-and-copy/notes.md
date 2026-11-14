@@ -10,15 +10,13 @@ Day 2 gave you the full object model — warehouses, databases, schemas, tables,
 Step 1 → Understand Stages         (where files live before loading)
 Step 2 → Create File Formats       (tell Snowflake how to parse the files)
 Step 3 → Load with COPY INTO       (move data from stage into a table)
-Step 4 → Understand VARIANT        (loading JSON and semi-structured data)
-Step 5 → Monitor and troubleshoot  (query load history, handle errors)
+Step 4 → Monitor and troubleshoot  (query load history, handle errors)
 ```
 
-**Three core concepts today:**
+**Two core concepts today:**
 
 1. **Stages and File Formats** — Internal vs external stages, all stage types, creating file formats for CSV, JSON, Parquet
 2. **COPY INTO — All Approaches** — Loading from internal stage, external stage, S3/Azure Blob, with all options and error handling modes
-3. **Semi-Structured Data and VARIANT** — Loading JSON into VARIANT columns, querying nested data with colon syntax and FLATTEN
 
 ---
 
@@ -427,186 +425,6 @@ VALIDATION_MODE  = 'RETURN_10_ROWS';   -- preview first 10 rows
 
 ---
 
-## Concept 3: Semi-Structured Data and VARIANT
-
-### What is Semi-Structured Data?
-
-Most real-world data sources don't send you clean flat CSVs. APIs return JSON, Kafka emits nested events, mobile apps log JSON arrays, and data lakes store Parquet files with nested structs. Snowflake handles all of these natively through the **VARIANT** data type.
-
-**VARIANT** is a column that can hold any JSON, XML, Avro, or Parquet value — including nested objects, arrays, and mixed types. No schema definition needed upfront.
-
-```
-Flat CSV:                           Nested JSON:
-─────────                           ────────────
-order_id, customer_id, amount       {
-1001,     42,          250.00         "order_id": 1001,
-1002,     43,          180.50         "customer": {
-                                        "id": 42,
-                                        "name": "Alice",
-                                        "tier": "GOLD"
-                                      },
-                                      "items": [
-                                        {"sku": "A1", "qty": 2, "price": 49.99},
-                                        {"sku": "B3", "qty": 1, "price": 150.00}
-                                      ],
-                                      "total": 250.00
-                                    }
-```
-
-### Creating a Table with VARIANT Column
-
-```sql
-USE DATABASE ECOMM_DB;
-USE SCHEMA RAW_DATA;
-
--- Table to hold raw JSON events from an e-commerce event stream
-CREATE TABLE IF NOT EXISTS ORDER_EVENTS_RAW (
-    event_id      NUMBER         AUTOINCREMENT PRIMARY KEY,
-    raw_event     VARIANT,                     -- the entire JSON object
-    _loaded_at    TIMESTAMP_NTZ  DEFAULT CURRENT_TIMESTAMP(),
-    _source_file  VARCHAR(500)
-);
-```
-
-### Loading JSON into VARIANT
-
-```sql
--- Using PARSE_JSON to insert JSON directly in SQL (for testing)
-INSERT INTO ORDER_EVENTS_RAW (raw_event)
-SELECT PARSE_JSON(column1)
-FROM VALUES
-  ('{"order_id": 1001, "customer": {"id": 1, "name": "Alice Johnson", "tier": "GOLD"}, "items": [{"sku": "WH-001", "product": "Wireless Headphones", "qty": 1, "price": 149.99}], "total": 149.99, "status": "DELIVERED", "order_date": "2024-01-10"}'),
-  ('{"order_id": 1002, "customer": {"id": 2, "name": "Bob Smith", "tier": "SILVER"}, "items": [{"sku": "RS-002", "product": "Running Shoes", "qty": 2, "price": 89.99}], "total": 179.98, "status": "DELIVERED", "order_date": "2024-01-15"}'),
-  ('{"order_id": 1003, "customer": {"id": 3, "name": "Priya Sharma", "tier": "PLATINUM"}, "items": [{"sku": "CM-003", "product": "Coffee Maker", "qty": 1, "price": 129.99}, {"sku": "YM-005", "product": "Yoga Mat", "qty": 2, "price": 39.99}], "total": 209.97, "status": "SHIPPED", "order_date": "2024-01-20"}');
-```
-
-**Loading JSON files via COPY INTO:**
-
-```sql
--- Load JSON files from stage into VARIANT column
-COPY INTO ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW (raw_event, _source_file)
-FROM (
-  SELECT $1, METADATA$FILENAME
-  FROM @ECOMM_DB.RAW_DATA.ECOMM_INTERNAL_STAGE/events/
-)
-FILE_FORMAT = (FORMAT_NAME = 'ECOMM_DB.RAW_DATA.JSON_FORMAT');
-```
-
-### Querying VARIANT Data — Colon Syntax
-
-Snowflake uses `:` (colon) to navigate into JSON keys and `::` to cast the extracted value to a SQL type.
-
-```sql
--- Basic extraction using colon notation
-SELECT
-    raw_event:order_id::NUMBER         AS order_id,
-    raw_event:status::VARCHAR          AS status,
-    raw_event:order_date::DATE         AS order_date,
-    raw_event:total::NUMBER(10,2)      AS total_amount,
-
-    -- Nested object — drill down with more colons
-    raw_event:customer:id::NUMBER      AS customer_id,
-    raw_event:customer:name::VARCHAR   AS customer_name,
-    raw_event:customer:tier::VARCHAR   AS loyalty_tier
-
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW;
-```
-
-**Accessing array elements by index:**
-
-```sql
--- Access first item in the items array (index 0)
-SELECT
-    raw_event:order_id::NUMBER               AS order_id,
-    raw_event:items[0]:sku::VARCHAR          AS first_item_sku,
-    raw_event:items[0]:product::VARCHAR      AS first_item_name,
-    raw_event:items[0]:qty::NUMBER           AS first_item_qty,
-    raw_event:items[0]:price::NUMBER(10,2)   AS first_item_price
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW;
-```
-
-### Flattening Arrays with LATERAL FLATTEN
-
-When a JSON object has an array and you need **one row per array element**, use `LATERAL FLATTEN`. This is the equivalent of a SQL `UNNEST` or `EXPLODE` in Spark.
-
-```sql
--- One row per item in the order's items array
-SELECT
-    o.raw_event:order_id::NUMBER         AS order_id,
-    o.raw_event:customer:name::VARCHAR   AS customer_name,
-    o.raw_event:order_date::DATE         AS order_date,
-    item.value:sku::VARCHAR              AS sku,
-    item.value:product::VARCHAR          AS product_name,
-    item.value:qty::NUMBER               AS quantity,
-    item.value:price::NUMBER(10,2)       AS unit_price,
-    item.value:qty::NUMBER
-      * item.value:price::NUMBER(10,2)   AS line_total
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW o,
-LATERAL FLATTEN(INPUT => o.raw_event:items) item;
-```
-
-**Output — each order becomes multiple rows, one per item:**
-
-```
-order_id | customer_name  | sku    | product_name        | qty | unit_price | line_total
----------|----------------|--------|---------------------|-----|------------|----------
-1001     | Alice Johnson  | WH-001 | Wireless Headphones | 1   | 149.99     | 149.99
-1002     | Bob Smith      | RS-002 | Running Shoes       | 2   |  89.99     | 179.98
-1003     | Priya Sharma   | CM-003 | Coffee Maker        | 1   | 129.99     | 129.99
-1003     | Priya Sharma   | YM-005 | Yoga Mat            | 2   |  39.99     |  79.98
-```
-
-### Useful VARIANT Functions
-
-```sql
--- Check if a key exists in a VARIANT object
-SELECT
-    raw_event:order_id,
-    raw_event:discount IS NULL AS has_no_discount  -- NULL if key missing
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW;
-
--- GET_PATH — alternative dot-path notation
-SELECT GET_PATH(raw_event, 'customer.name') FROM ORDER_EVENTS_RAW;
-
--- TYPEOF — what type is a value inside VARIANT?
-SELECT TYPEOF(raw_event:order_id) FROM ORDER_EVENTS_RAW;
--- Returns: 'INTEGER', 'REAL', 'TEXT', 'BOOLEAN', 'ARRAY', 'OBJECT', 'NULL'
-
--- ARRAY_SIZE — how many items in an array?
-SELECT
-    raw_event:order_id::NUMBER         AS order_id,
-    ARRAY_SIZE(raw_event:items)        AS item_count
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW;
-
--- OBJECT_KEYS — list all keys in a JSON object
-SELECT OBJECT_KEYS(raw_event) FROM ORDER_EVENTS_RAW LIMIT 1;
--- Returns: ["customer", "items", "order_date", "order_id", "status", "total"]
-```
-
-### Flattening VARIANT into a Structured Table (Staging Step)
-
-After loading raw JSON into VARIANT, the staging step extracts it into a proper structured table:
-
-```sql
--- Flatten JSON events into a clean structured staging table
-CREATE OR REPLACE TRANSIENT TABLE ECOMM_DB.STAGING.STG_ORDER_EVENTS AS
-SELECT
-    o.raw_event:order_id::NUMBER(15,0)       AS order_id,
-    o.raw_event:customer:id::NUMBER(10,0)    AS customer_id,
-    o.raw_event:customer:name::VARCHAR       AS customer_name,
-    o.raw_event:customer:tier::VARCHAR       AS loyalty_tier,
-    o.raw_event:order_date::DATE             AS order_date,
-    o.raw_event:status::VARCHAR              AS status,
-    o.raw_event:total::NUMBER(12,2)          AS total_amount,
-    ARRAY_SIZE(o.raw_event:items)            AS item_count,
-    o._loaded_at
-FROM ECOMM_DB.RAW_DATA.ORDER_EVENTS_RAW o;
-
-SELECT * FROM ECOMM_DB.STAGING.STG_ORDER_EVENTS;
-```
-
----
-
 ## Summary
 
 | Concept | Key Takeaway |
@@ -617,8 +435,7 @@ SELECT * FROM ECOMM_DB.STAGING.STG_ORDER_EVENTS;
 | **File formats** | Named objects that define how to parse a file. Create once, reuse across many COPY INTO statements. |
 | **COPY INTO** | Bulk loader. Idempotent — tracks loaded files for 64 days. Use `VALIDATION_MODE` to preview before loading. |
 | **ON_ERROR** | `ABORT_STATEMENT` for production, `CONTINUE` or `SKIP_FILE_N%` when some bad rows are tolerable. |
-| **VARIANT** | Snowflake's native type for JSON/XML/Parquet. No schema needed upfront — query with `:` colon notation. |
-| **LATERAL FLATTEN** | Explode JSON arrays into rows — one row per array element. Essential for event data. |
 | **Metadata columns** | `METADATA$FILENAME` during COPY INTO captures the source file name — critical for data lineage. |
+| **Column mapping** | Use `$1`, `$2`... with a SELECT subquery to reorder, skip, or transform file columns during load. |
 
-**Next:** Day 4 covers Time Travel, Fail-safe, Cloning, and data recovery — Snowflake's built-in protection features.
+**Next:** Day 4 covers semi-structured data — VARIANT, JSON loading, colon syntax, and LATERAL FLATTEN.

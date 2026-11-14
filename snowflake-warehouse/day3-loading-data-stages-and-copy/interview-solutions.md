@@ -1,6 +1,6 @@
 # Day 3 — Interview Solutions: Loading Data, Stages, and COPY INTO
 
-> Complete answers to all 30 questions. Read these after attempting the questions yourself.
+> Complete answers to all 20 questions. Read these after attempting the questions yourself.
 
 ---
 
@@ -292,206 +292,9 @@ FROM (
 
 ---
 
-## Concept 3: Semi-Structured Data and VARIANT
-
-**Q16 — What is VARIANT? What can it store?**
-
-`VARIANT` is Snowflake's native semi-structured data type. A VARIANT column can store any of:
-- **JSON objects** — `{"key": "value"}`
-- **JSON arrays** — `[1, 2, 3]`
-- **Nested structures** — objects inside arrays inside objects
-- **Primitive values** — a single string, number, boolean, or null
-- **XML** — after parsing with `PARSE_XML()`
-- **Avro and Parquet data** — loaded natively, stored as VARIANT
-
-A single VARIANT column can hold values of different shapes in different rows — one row might be a flat object, another a deeply nested one. No schema enforced at the column level.
-
----
-
-**Q17 — How to extract from VARIANT? What is `::`?**
-
-Use the **colon `:` operator** to navigate into JSON keys. Use **double colon `::` to cast** the extracted value to a SQL type.
-
-```sql
--- Extract and cast
-SELECT
-    raw_event:order_id::NUMBER       AS order_id,     -- extract key, cast to NUMBER
-    raw_event:customer:name::VARCHAR AS customer_name, -- nested key
-    raw_event:items[0]:sku::VARCHAR  AS first_sku      -- array index + key
-FROM ORDER_EVENTS_RAW;
-```
-
-Without `::`, the extracted value is still VARIANT type. With `::`, it becomes a standard SQL type (NUMBER, VARCHAR, DATE, BOOLEAN, etc.) that SQL functions can operate on.
-
----
-
-**Q18 — What does `STRIP_OUTER_ARRAY = TRUE` do in a JSON file format?**
-
-When a JSON file contains a **top-level array** of objects, like this:
-
-```json
-[
-  {"order_id": 1001, "total": 250.00},
-  {"order_id": 1002, "total": 180.50},
-  {"order_id": 1003, "total": 340.00}
-]
-```
-
-Without `STRIP_OUTER_ARRAY = TRUE`, Snowflake treats the entire file as one VARIANT value — the whole array is one row. That is almost never what you want.
-
-With `STRIP_OUTER_ARRAY = TRUE`, Snowflake strips the outer `[...]` and loads **each object as a separate row** — 3 rows in this example.
-
-```sql
-CREATE FILE FORMAT JSON_FORMAT
-  TYPE              = 'JSON'
-  STRIP_OUTER_ARRAY = TRUE;   -- each array element = one row
-```
-
-**When NOT to use it:** If the file contains one JSON object per line (newline-delimited JSON / NDJSON), there is no outer array — `STRIP_OUTER_ARRAY = FALSE` (default) is correct.
-
----
-
-**Q19 — Explain `LATERAL FLATTEN`. What problem does it solve?**
-
-**Problem:** SQL is row-oriented — one row in, one row out. But JSON arrays contain multiple values in a single field. If an order has 5 items in a JSON array, you have 1 row but need 5 rows to work with the items individually.
-
-**LATERAL FLATTEN** explodes a JSON array into multiple rows — one row per array element. It is Snowflake's equivalent of SQL `UNNEST` or Spark's `EXPLODE`.
-
-```sql
--- Without FLATTEN: 1 row per order, items array is opaque
-SELECT raw_event:order_id, raw_event:items FROM ORDER_EVENTS_RAW;
--- order 1001 | [{"sku":"WH-001","qty":1},{"sku":"RS-002","qty":2}]
-
--- With FLATTEN: 1 row per item
-SELECT
-    o.raw_event:order_id::NUMBER   AS order_id,
-    f.value:sku::VARCHAR           AS sku,
-    f.value:qty::NUMBER            AS qty
-FROM ORDER_EVENTS_RAW o,
-LATERAL FLATTEN(INPUT => o.raw_event:items) f;
--- order 1001 | WH-001 | 1
--- order 1001 | RS-002 | 2
-```
-
-The `f.value` reference accesses each element of the array in turn. `LATERAL` means the FLATTEN can reference the row from the outer table (`o`) — it's correlated.
-
----
-
-**Q20 — Write a query: one row per event, columns: user_id, event_type, event_timestamp.**
-
-```sql
--- Assuming the JSON is in a table called USER_EVENTS_RAW with column raw_event (VARIANT)
-
-SELECT
-    e.raw_event:user_id::NUMBER         AS user_id,
-    f.value:type::VARCHAR               AS event_type,
-    f.value:ts::TIMESTAMP_NTZ           AS event_timestamp
-FROM USER_EVENTS_RAW e,
-LATERAL FLATTEN(INPUT => e.raw_event:events) f
-ORDER BY user_id, event_timestamp;
-```
-
-Output:
-```
-user_id | event_type | event_timestamp
---------|------------|-------------------
-101     | click      | 2024-01-01 10:00:00
-101     | purchase   | 2024-01-01 10:05:00
-```
-
----
-
-**Q21 — What does `TYPEOF` return? Three possible values.**
-
-`TYPEOF` returns a VARCHAR string describing the data type of the value stored inside a VARIANT at runtime:
-
-| Return Value | Meaning |
-|---|---|
-| `'INTEGER'` | Whole number (no decimal) |
-| `'REAL'` | Floating-point number |
-| `'TEXT'` | String value |
-| `'BOOLEAN'` | true or false |
-| `'ARRAY'` | JSON array `[...]` |
-| `'OBJECT'` | JSON object `{...}` |
-| `'NULL_VALUE'` | Explicit JSON null |
-
-Three example return values: `'TEXT'`, `'INTEGER'`, `'ARRAY'`.
-
----
-
-**Q22 — `raw_event:customer:email::VARCHAR` returns NULL. Three possible reasons.**
-
-1. **The key `email` does not exist** in that row's JSON object. When a key is missing, Snowflake returns NULL rather than an error. The row's JSON might be `{"customer": {"id": 42, "name": "Alice"}}` — no email key.
-
-2. **The JSON value is explicitly null** — `{"customer": {"email": null}}`. JSON null is stored as VARIANT null, which casts to SQL NULL.
-
-3. **The key path is wrong** — a typo or case mismatch. VARIANT key access is **case-sensitive**. If the JSON has `"Email"` (capital E) but you query `raw_event:customer:email`, you get NULL. The correct query would be `raw_event:customer:Email::VARCHAR`.
-
----
-
-**Q23 — What is `OBJECT_KEYS`? What is `ARRAY_SIZE`? Use case for each.**
-
-**`OBJECT_KEYS(variant_object)`**
-Returns an ARRAY of all the top-level key names in a JSON object.
-
-```sql
-SELECT OBJECT_KEYS(raw_event) FROM ORDER_EVENTS_RAW LIMIT 1;
--- Returns: ["customer","items","order_date","order_id","status","total"]
-```
-
-**Use case:** Schema discovery on unknown JSON — when a new data source arrives and you don't know what keys the JSON contains. Run OBJECT_KEYS on a sample to understand the structure before building the extraction query.
-
----
-
-**`ARRAY_SIZE(variant_array)`**
-Returns the number of elements in a JSON array.
-
-```sql
-SELECT raw_event:order_id::NUMBER, ARRAY_SIZE(raw_event:items) AS item_count
-FROM ORDER_EVENTS_RAW;
-```
-
-**Use case:** Data quality validation — checking that multi-item orders have the expected number of line items. If `ARRAY_SIZE(raw_event:items) = 0` for any order, that is a data quality issue to flag.
-
----
-
-**Q24 — Load Parquet files from a stage.**
-
-```sql
--- Step 1: Create the file format
-CREATE FILE FORMAT IF NOT EXISTS PARQUET_FORMAT
-  TYPE              = 'PARQUET'
-  SNAPPY_COMPRESSION = TRUE;
-
--- Step 2: Create the stage (pointing to where Parquet files are)
-CREATE STAGE IF NOT EXISTS PARQUET_STAGE
-  URL         = 'azure://mystorageaccount.blob.core.windows.net/parquet-data/'
-  CREDENTIALS = (AZURE_SAS_TOKEN = '<token>');
-
--- Step 3: Create a target table with VARIANT column (Parquet schema is embedded)
-CREATE TABLE IF NOT EXISTS PRODUCTS_PARQUET_RAW (
-    raw_data   VARIANT,
-    _loaded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    _source_file VARCHAR(500)
-);
-
--- Step 4: COPY INTO — Parquet loads into VARIANT automatically
-COPY INTO PRODUCTS_PARQUET_RAW (raw_data, _source_file)
-FROM (
-  SELECT $1, METADATA$FILENAME
-  FROM @PARQUET_STAGE
-)
-FILE_FORMAT = (FORMAT_NAME = 'PARQUET_FORMAT')
-ON_ERROR    = 'ABORT_STATEMENT';
-```
-
-After loading, query Parquet data the same way as JSON using colon notation: `raw_data:product_name::VARCHAR`.
-
----
-
 ## Mixed / Senior-Level Questions
 
-**Q25 — 500 files nightly, 2–3 have issues. Load good files, capture bad ones, alert team.**
+**Q16 — 500 files nightly, 2–3 have issues. Load good files, capture bad ones, alert team.**
 
 **Strategy:**
 
@@ -546,7 +349,7 @@ FORCE       = TRUE;   -- override "already loaded" history
 
 ---
 
-**Q26 — User Stage vs Table Stage vs Named Internal Stage for production ETL?**
+**Q17 — User Stage vs Table Stage vs Named Internal Stage for production ETL?**
 
 **Choose Named Internal Stage for production ETL.** Here is why:
 
@@ -565,34 +368,7 @@ GRANT READ ON STAGE PROD_ORDERS_STAGE TO ROLE DATA_ENGINEER;
 
 ---
 
-**Q27 — JSON where `order_total` is sometimes number, sometimes string, sometimes missing.**
-
-**How Snowflake stores it in VARIANT:**
-
-VARIANT accepts any JSON value regardless of type inconsistency between rows. Each row stores whatever the JSON contains:
-- Row 1: `order_total` = `250.00` → stored as REAL inside VARIANT
-- Row 2: `order_total` = `"250.00"` → stored as TEXT inside VARIANT
-- Row 3: `order_total` missing → returns NULL when queried
-
-**How to safely extract as NUMBER:**
-
-```sql
-SELECT
-    raw_event:order_id::NUMBER                AS order_id,
-    -- TRY_CAST handles both numeric and string values without erroring
-    TRY_CAST(raw_event:order_total::VARCHAR AS NUMBER(12,2)) AS order_total
-FROM ORDER_EVENTS_RAW;
-```
-
-`TRY_CAST` (or `TRY_TO_NUMBER`) returns NULL instead of erroring when the cast fails. This handles:
-- Numeric `250.00` → VARCHAR `"250.00"` → NUMBER `250.00` ✓
-- String `"250.00"` → VARCHAR `"250.00"` → NUMBER `250.00` ✓
-- Missing key → NULL → TRY_CAST(NULL) = NULL ✓
-- Invalid string `"N/A"` → TRY_CAST fails gracefully → NULL (not an error) ✓
-
----
-
-**Q28 — Loaded with `ON_ERROR = 'CONTINUE'`. How to see which rows failed?**
+**Q18 — Loaded with `ON_ERROR = 'CONTINUE'`. How to see which rows failed?**
 
 ```sql
 -- Method 1: COPY_HISTORY — file-level errors
@@ -614,7 +390,7 @@ The `VALIDATE()` function returns: rejected row content, error message, file nam
 
 ---
 
-**Q29 — `COPY INTO` vs `INSERT INTO ... SELECT` from a stage query. When to use each?**
+**Q19 — `COPY INTO` vs `INSERT INTO ... SELECT` from a stage query. When to use each?**
 
 | Approach | Characteristics | Use When |
 |---|---|---|
@@ -635,7 +411,7 @@ This can't use COPY INTO — it's reading from other Snowflake tables, not files
 
 ---
 
-**Q30 (System design) — E-commerce ingestion pipeline: CSV daily, JSON every 5 min, Parquet weekly.**
+**Q20 (System design) — E-commerce ingestion pipeline: CSV daily, JSON every 5 min, Parquet weekly.**
 
 **Source A — Customer CSV (daily from Azure Blob):**
 
@@ -661,7 +437,7 @@ ON_ERROR    = 'ABORT_STATEMENT'
 PATTERN     = '.*customers_[0-9]{8}\.csv\.gz';
 ```
 
-**Source B — Order Events JSON (every 5 min from Azure Blob):**
+**Source B — Order Events CSV (every 5 min from Azure Blob):**
 
 ```sql
 -- Stage
@@ -669,20 +445,24 @@ CREATE STAGE ORDER_EVENTS_STAGE
   URL         = 'azure://account.blob.core.windows.net/order-events/'
   CREDENTIALS = (AZURE_SAS_TOKEN = '<token>');
 
--- File format: JSON array of events per file
+-- File format
 CREATE FILE FORMAT ORDER_EVENTS_FMT
-  TYPE='JSON' STRIP_OUTER_ARRAY=TRUE COMPRESSION='AUTO';
+  TYPE='CSV' SKIP_HEADER=1 FIELD_DELIMITER=',' FIELD_OPTIONALLY_ENCLOSED_BY='"'
+  NULL_IF=('NULL','') EMPTY_FIELD_AS_NULL=TRUE;
 
--- Target: PERMANENT table with VARIANT column (raw JSON preserved)
+-- Target: PERMANENT table (order events are financial records)
 CREATE TABLE RAW_DATA.ORDER_EVENTS_RAW (
-    raw_event    VARIANT,
-    _loaded_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    _source_file VARCHAR(500)
+    event_id      NUMBER AUTOINCREMENT,
+    order_id      NUMBER,
+    event_type    VARCHAR,
+    event_ts      TIMESTAMP_NTZ,
+    _loaded_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _source_file  VARCHAR(500)
 );
 
 -- COPY INTO: run every 5 min via Airflow, CONTINUE (losing a few events acceptable)
-COPY INTO RAW_DATA.ORDER_EVENTS_RAW (raw_event, _source_file)
-FROM (SELECT $1, METADATA$FILENAME FROM @ORDER_EVENTS_STAGE)
+COPY INTO RAW_DATA.ORDER_EVENTS_RAW (order_id, event_type, event_ts, _source_file)
+FROM (SELECT $1::NUMBER, $2::VARCHAR, $3::TIMESTAMP_NTZ, METADATA$FILENAME FROM @ORDER_EVENTS_STAGE)
 FILE_FORMAT = (FORMAT_NAME='ORDER_EVENTS_FMT')
 ON_ERROR    = 'SKIP_FILE_10%';   -- skip file only if >10% of records fail
 -- Files automatically deduplicated by Snowflake load history (idempotent)
