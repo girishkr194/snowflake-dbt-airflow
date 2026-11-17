@@ -8,34 +8,34 @@ You will insert, update, and delete data in the RAW layer, watch Streams capture
 
 **The pipeline:**
 ```
-ORDERS_RAW  ──[stream]──►  STG_ORDERS  ──[stream]──►  ORDERS_MART
-     │                          │
-  INSERT                    MERGE (upsert)
-  UPDATE                        │
-  DELETE                    MERGE (upsert)
-     │
-  Task 1 (every 1 min)       Task 2 (after Task 1)
+ORDERS_RAW  ──[stream]──►  STG_ORDERS  ──────────►  ORDERS_MART
+     │                          │                        │
+  INSERT                    MERGE (upsert)           MERGE (upsert)
+  UPDATE                                                 │
+  DELETE                                                 │
+                                                         │
+              RAW_TO_STG_TASK (root, 1 min)              │
+              STG_TO_MART_TASK (child, after root) ──────┘
+              Both tasks in ECOMM_DB.RAW_DATA schema
 ```
+
+> **Important:** Both tasks must be in the **same schema** for `AFTER` chaining to work. We keep both in `ECOMM_DB.RAW_DATA`.
 
 ---
 
 ## Step 1 — Set Up the Schema and Tables
 
-### Database and schema
-
 ```sql
 USE ROLE SYSADMIN;
 USE WAREHOUSE COMPUTE_WH;
 
--- Use the same DB from Day 2/3 or create fresh
 CREATE DATABASE IF NOT EXISTS ECOMM_DB;
-
-CREATE SCHEMA IF NOT EXISTS ECOMM_DB.RAW_DATA;
-CREATE SCHEMA IF NOT EXISTS ECOMM_DB.STAGING;
-CREATE SCHEMA IF NOT EXISTS ECOMM_DB.MARTS;
+CREATE SCHEMA  IF NOT EXISTS ECOMM_DB.RAW_DATA;
+CREATE SCHEMA  IF NOT EXISTS ECOMM_DB.STAGING;
+CREATE SCHEMA  IF NOT EXISTS ECOMM_DB.MARTS;
 ```
 
-### RAW table — the source of truth for incoming data
+### RAW table
 
 ```sql
 USE SCHEMA ECOMM_DB.RAW_DATA;
@@ -54,7 +54,7 @@ CREATE OR REPLACE TABLE ORDERS_RAW (
 );
 ```
 
-### STAGING table — cleaned, deduplicated, always has latest state
+### STAGING table
 
 ```sql
 USE SCHEMA ECOMM_DB.STAGING;
@@ -69,17 +69,17 @@ CREATE OR REPLACE TABLE STG_ORDERS (
     total_amount   NUMBER(12,2),
     status         VARCHAR(50),
     order_date     DATE,
-    is_deleted     BOOLEAN        DEFAULT FALSE,   -- soft delete flag
+    is_deleted     BOOLEAN        DEFAULT FALSE,
     stg_updated_at TIMESTAMP_NTZ  DEFAULT CURRENT_TIMESTAMP()
 );
 ```
 
-### MART table — aggregated, business-ready
+### MART table
 
 ```sql
 USE SCHEMA ECOMM_DB.MARTS;
 
-CREATE OR REPLACE TABLE ORDERS_MART (
+CREATE TABLE IF NOT EXISTS ORDERS_MART (
     order_date        DATE           PRIMARY KEY,
     total_orders      NUMBER,
     confirmed_orders  NUMBER,
@@ -92,46 +92,40 @@ CREATE OR REPLACE TABLE ORDERS_MART (
 );
 ```
 
+> `ORDERS_MART` uses `CREATE TABLE IF NOT EXISTS` — not `CREATE OR REPLACE` — so existing mart data is not wiped when you re-run setup.
+
 ---
 
 ## Step 2 — Create Streams
 
-One stream on each layer to capture changes as they flow through.
-
 ```sql
--- Stream on RAW: captures everything that changes in ORDERS_RAW
-CREATE STREAM IF NOT EXISTS ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
+-- Stream on RAW: captures INSERT / UPDATE / DELETE on ORDERS_RAW
+CREATE OR REPLACE STREAM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
   ON TABLE ECOMM_DB.RAW_DATA.ORDERS_RAW
-  COMMENT = 'Captures INSERT / UPDATE / DELETE on ORDERS_RAW';
+  COMMENT = 'Captures all DML changes on ORDERS_RAW';
 
--- Stream on STAGING: captures changes after the MERGE writes to STG_ORDERS
-CREATE STREAM IF NOT EXISTS ECOMM_DB.STAGING.STG_ORDERS_STREAM
-  ON TABLE ECOMM_DB.STAGING.STG_ORDERS
-  COMMENT = 'Captures changes written into STG_ORDERS by Task 1';
-```
-
-Verify both streams:
-```sql
+-- Verify
 SHOW STREAMS IN DATABASE ECOMM_DB;
 ```
 
+> Re-creating tables (Step 1) drops their streams. Always re-run Step 2 after re-running Step 1.
+
 ---
 
-## Step 3 — The MERGE Logic
+## Step 3 — The MERGE Logic (understand before creating tasks)
 
 ### MERGE 1: RAW → STAGING
 
-Handles all three change types from the stream:
+Handles all three change types from the stream in one statement:
 
 ```sql
 MERGE INTO ECOMM_DB.STAGING.STG_ORDERS AS tgt
 USING (
-    SELECT *
-    FROM   ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
+    SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
 ) AS src
 ON tgt.order_id = src.order_id
 
--- Row exists in staging AND this is a live row (INSERT action = new value from an update or a fresh insert)
+-- New insert OR the new-value row of an update (both have ACTION = 'INSERT')
 WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
     UPDATE SET
         tgt.customer_id    = src.customer_id,
@@ -145,13 +139,13 @@ WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
         tgt.is_deleted     = FALSE,
         tgt.stg_updated_at = CURRENT_TIMESTAMP()
 
--- Row exists in staging AND this is a DELETE (hard delete from RAW)
+-- Hard delete from RAW → soft delete in STAGING
 WHEN MATCHED AND src.METADATA$ACTION = 'DELETE' AND src.METADATA$ISUPDATE = FALSE THEN
     UPDATE SET
         tgt.is_deleted     = TRUE,
         tgt.stg_updated_at = CURRENT_TIMESTAMP()
 
--- Row does not exist in staging — brand new order
+-- Brand new row not yet in STAGING
 WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
     INSERT (order_id, customer_id, customer_name, product, quantity,
             unit_price, total_amount, status, order_date, is_deleted, stg_updated_at)
@@ -159,28 +153,24 @@ WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
             src.unit_price, src.total_amount, src.status, src.order_date, FALSE, CURRENT_TIMESTAMP());
 ```
 
-**Key design decisions:**
-- Deletes in RAW become **soft deletes** in staging (`is_deleted = TRUE`). This preserves history — you never lose the fact that an order existed.
-- The `DELETE` rows from an UPDATE (`METADATA$ISUPDATE = TRUE`) are ignored — the matching `INSERT` row carries the new values and handles it via the `WHEN MATCHED AND METADATA$ACTION = 'INSERT'` branch.
-
 ### MERGE 2: STAGING → MART
 
-Rebuilds the daily summary from staging, respecting soft deletes:
+Re-aggregates the daily summary from staging, excluding soft-deleted rows:
 
 ```sql
 MERGE INTO ECOMM_DB.MARTS.ORDERS_MART AS tgt
 USING (
     SELECT
         order_date,
-        COUNT(*)                                                   AS total_orders,
-        SUM(CASE WHEN status = 'CONFIRMED'  THEN 1 ELSE 0 END)    AS confirmed_orders,
-        SUM(CASE WHEN status = 'SHIPPED'    THEN 1 ELSE 0 END)    AS shipped_orders,
-        SUM(CASE WHEN status = 'DELIVERED'  THEN 1 ELSE 0 END)    AS delivered_orders,
-        SUM(CASE WHEN status = 'CANCELLED'  THEN 1 ELSE 0 END)    AS cancelled_orders,
-        SUM(total_amount)                                          AS total_revenue,
-        AVG(total_amount)                                          AS avg_order_value
+        COUNT(*)                                                AS total_orders,
+        SUM(CASE WHEN status = 'CONFIRMED'  THEN 1 ELSE 0 END) AS confirmed_orders,
+        SUM(CASE WHEN status = 'SHIPPED'    THEN 1 ELSE 0 END) AS shipped_orders,
+        SUM(CASE WHEN status = 'DELIVERED'  THEN 1 ELSE 0 END) AS delivered_orders,
+        SUM(CASE WHEN status = 'CANCELLED'  THEN 1 ELSE 0 END) AS cancelled_orders,
+        SUM(total_amount)                                       AS total_revenue,
+        AVG(total_amount)                                       AS avg_order_value
     FROM ECOMM_DB.STAGING.STG_ORDERS
-    WHERE is_deleted = FALSE                -- exclude soft-deleted rows
+    WHERE is_deleted = FALSE
     GROUP BY order_date
 ) AS src
 ON tgt.order_date = src.order_date
@@ -206,10 +196,12 @@ WHEN NOT MATCHED THEN
 
 ## Step 4 — Create the Task Chain
 
+Both tasks live in `ECOMM_DB.RAW_DATA` — Snowflake requires tasks in the same schema for `AFTER` chaining.
+
 ```sql
 -- Task 1 (ROOT): RAW → STAGING
--- Runs every minute, only if the raw stream has changes
-CREATE TASK IF NOT EXISTS ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK
+-- Runs every minute; skips if stream is empty
+CREATE OR REPLACE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK
     WAREHOUSE = COMPUTE_WH
     SCHEDULE  = '1 MINUTE'
     WHEN SYSTEM$STREAM_HAS_DATA('ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM')
@@ -234,8 +226,8 @@ WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT' THEN
 
 
 -- Task 2 (CHILD): STAGING → MART
--- Runs after Task 1 completes — no schedule, no WHEN needed
-CREATE TASK IF NOT EXISTS ECOMM_DB.STAGING.STG_TO_MART_TASK
+-- Same schema as Task 1 — required for AFTER chaining
+CREATE OR REPLACE TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK
     WAREHOUSE = COMPUTE_WH
     AFTER     ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK
 AS
@@ -270,15 +262,15 @@ WHEN NOT MATCHED THEN
 
 
 -- Resume: child first, root last
-ALTER TASK ECOMM_DB.STAGING.STG_TO_MART_TASK RESUME;
-ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK RESUME;
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK RESUME;
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  RESUME;
 ```
 
 ---
 
 ## Step 5 — Verification Queries
 
-Use these after every test to confirm all three layers are consistent.
+Run these after every batch to confirm all three layers are in sync.
 
 ```sql
 -- RAW layer
@@ -291,10 +283,10 @@ SELECT order_id, customer_name, product, status, total_amount, is_deleted, stg_u
 FROM ECOMM_DB.STAGING.STG_ORDERS
 ORDER BY order_id;
 
--- MART layer (only active, aggregated by date)
+-- MART layer
 SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 
--- Stream status (should be 0 after task runs)
+-- Stream: should be FALSE after task runs
 SELECT SYSTEM$STREAM_HAS_DATA('ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM') AS raw_stream_has_data;
 
 -- Task run history
@@ -309,7 +301,7 @@ ORDER BY scheduled_time DESC;
 
 ## Step 6 — Test Data: Insert, Update, and Delete
 
-Use these batches to test the pipeline end-to-end. Run each batch, trigger the task, then verify all three layers.
+Run each batch in order. After each one, check the stream, trigger the task, and verify all three layers.
 
 ```sql
 USE ROLE SYSADMIN;
@@ -331,7 +323,7 @@ VALUES
     (1006, 6, 'Sophie Dubois',  'Standing Desk',       1, 499.99, 499.99, 'CONFIRMED', '2024-01-12');
 ```
 
-Check the stream — all 6 rows show as `INSERT`:
+Check stream — all 6 rows as `INSERT`, `METADATA$ISUPDATE = FALSE`:
 ```sql
 SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
 FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM;
@@ -341,8 +333,8 @@ Trigger and verify:
 ```sql
 EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
 
-SELECT order_id, customer_name, status, total_amount FROM ECOMM_DB.RAW_DATA.ORDERS_RAW  ORDER BY order_id;
-SELECT order_id, customer_name, status, is_deleted   FROM ECOMM_DB.STAGING.STG_ORDERS   ORDER BY order_id;
+SELECT order_id, customer_name, status, total_amount FROM ECOMM_DB.RAW_DATA.ORDERS_RAW ORDER BY order_id;
+SELECT order_id, customer_name, status, is_deleted   FROM ECOMM_DB.STAGING.STG_ORDERS  ORDER BY order_id;
 SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 ```
 
@@ -367,12 +359,12 @@ UPDATE ORDERS_RAW SET status = 'DELIVERED', updated_at = CURRENT_TIMESTAMP() WHE
 UPDATE ORDERS_RAW SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1004;
 ```
 
-Check the stream — each UPDATE produces 2 rows (pre/post image):
+Check stream — each UPDATE = 2 rows (pre/post image):
 ```sql
 SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
 FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
 ORDER BY order_id, METADATA$ACTION DESC;
--- 6 rows total: DELETE+INSERT for each of 1002, 1003, 1004
+-- 6 rows: DELETE+INSERT for each of 1002, 1003, 1004
 ```
 
 Trigger and verify:
@@ -398,7 +390,7 @@ SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 DELETE FROM ORDERS_RAW WHERE order_id = 1004;
 ```
 
-Check the stream — single row, `METADATA$ACTION = 'DELETE'`, `METADATA$ISUPDATE = FALSE`:
+Check stream — 1 row, `ACTION = 'DELETE'`, `ISUPDATE = FALSE`:
 ```sql
 SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
 FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM;
@@ -408,13 +400,13 @@ Trigger and verify:
 ```sql
 EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
 
--- RAW: 5 rows (Carlos removed)
-SELECT COUNT(*) AS raw_count FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+SELECT COUNT(*) AS raw_count FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;           -- 5
+SELECT COUNT(*) AS stg_count FROM ECOMM_DB.STAGING.STG_ORDERS;            -- still 6
 
--- STAGING: still 6 rows — Carlos is soft-deleted, not removed
+-- Carlos: is_deleted = TRUE in staging (soft delete, row preserved)
 SELECT order_id, customer_name, status, is_deleted FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
 
--- MART: Jan 11 drops to 1 order (Carlos excluded by is_deleted = TRUE)
+-- Jan 11: drops to 1 order (Carlos excluded)
 SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 ```
 
@@ -437,7 +429,7 @@ UPDATE ORDERS_RAW SET status = 'SHIPPED',   updated_at = CURRENT_TIMESTAMP() WHE
 UPDATE ORDERS_RAW SET status = 'DELIVERED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1006;
 ```
 
-Check the stream — 7 rows (3 inserts + 2×2 for the two updates):
+Check stream — 7 rows (3 inserts + 2×2 for the two updates):
 ```sql
 SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
 FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
@@ -460,7 +452,7 @@ SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 ### Batch 5 — Quantity and price correction
 
 ```sql
--- Lena ordered 2 mics, not 1 — fix quantity and recalculate total
+-- Lena ordered 2 mics, not 1
 UPDATE ORDERS_RAW
 SET quantity = 2, total_amount = 159.98, updated_at = CURRENT_TIMESTAMP()
 WHERE order_id = 1009;
@@ -507,12 +499,21 @@ ORDER BY scheduled_time DESC;
 
 ---
 
+### Teardown — suspend tasks when done
+
+```sql
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  SUSPEND;
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK SUSPEND;
+```
+
+---
+
 ## Summary
 
 | Layer | Table | How it gets data |
 |---|---|---|
 | RAW | `ORDERS_RAW` | Direct INSERT / UPDATE / DELETE |
-| STAGING | `STG_ORDERS` | MERGE from stream on RAW (Task 1) |
-| MART | `ORDERS_MART` | MERGE from full STG_ORDERS scan (Task 2) |
+| STAGING | `STG_ORDERS` | MERGE from stream on RAW (RAW_TO_STG_TASK) |
+| MART | `ORDERS_MART` | MERGE from full STG_ORDERS scan (STG_TO_MART_TASK) |
 
 **Next:** Day 5 covers semi-structured data — VARIANT, loading JSON, colon syntax, and LATERAL FLATTEN.

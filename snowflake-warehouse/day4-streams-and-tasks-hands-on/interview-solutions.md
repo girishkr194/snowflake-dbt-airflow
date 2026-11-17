@@ -128,7 +128,7 @@ ORDER BY scheduled_time DESC;
 ALTER WAREHOUSE COMPUTE_WH RESUME;
 
 -- Step 3: Manually run just Task 2 — no need to reprocess Task 1
-EXECUTE TASK ECOMM_DB.STAGING.STG_TO_MART_TASK;
+EXECUTE TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK;
 
 -- Step 4: Verify mart is now correct
 SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
@@ -168,8 +168,8 @@ The stream is empty so there is nothing to replay through it. You need to do a f
 
 ```sql
 -- Step 1: Suspend tasks to prevent interference during rebuild
-ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK SUSPEND;
-ALTER TASK ECOMM_DB.STAGING.STG_TO_MART_TASK SUSPEND;
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  SUSPEND;
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK SUSPEND;
 
 -- Step 2: Wipe staging and mart
 TRUNCATE TABLE ECOMM_DB.STAGING.STG_ORDERS;
@@ -202,9 +202,9 @@ WHEN NOT MATCHED THEN
     VALUES (src.order_date, src.total_orders, src.confirmed_orders, src.shipped_orders,
             src.delivered_orders, src.cancelled_orders, src.total_revenue, src.avg_order_value);
 
--- Step 5: Resume tasks
-ALTER TASK ECOMM_DB.STAGING.STG_TO_MART_TASK RESUME;
-ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK RESUME;
+-- Step 5: Resume tasks (child first, root last)
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK RESUME;
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  RESUME;
 ```
 
 ---
@@ -235,11 +235,11 @@ ALTER TABLE ECOMM_DB.STAGING.STG_ORDERS ADD COLUMN region VARCHAR(50);
 
 -- 3. Drop and recreate Task 1 with the updated MERGE SQL
 --    (Tasks cannot be ALTER-ed to change their SQL — must DROP and CREATE)
-ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK SUSPEND;
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  SUSPEND;
 DROP TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
--- CREATE TASK ... with updated MERGE SQL including region
-ALTER TASK ECOMM_DB.STAGING.STG_TO_MART_TASK RESUME;
-ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK RESUME;
+-- CREATE OR REPLACE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK ... with updated MERGE SQL including region
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK RESUME;
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  RESUME;
 
 -- 4. If the mart needs region-level breakdowns, update ORDERS_MART and Task 2 similarly
 --    If the mart aggregates don't need region, no change to Task 2 is required
