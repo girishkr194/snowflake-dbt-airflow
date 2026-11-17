@@ -307,6 +307,206 @@ ORDER BY scheduled_time DESC;
 
 ---
 
+## Step 6 — Test Data: Insert, Update, and Delete
+
+Use these batches to test the pipeline end-to-end. Run each batch, trigger the task, then verify all three layers.
+
+```sql
+USE ROLE SYSADMIN;
+USE WAREHOUSE COMPUTE_WH;
+USE SCHEMA ECOMM_DB.RAW_DATA;
+```
+
+### Batch 1 — Initial inserts (6 orders across 3 dates)
+
+```sql
+INSERT INTO ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date)
+VALUES
+    (1001, 1, 'Alice Johnson',  'Wireless Headphones', 1, 149.99, 149.99, 'CONFIRMED', '2024-01-10'),
+    (1002, 2, 'Bob Smith',      'Running Shoes',       2,  89.99, 179.98, 'CONFIRMED', '2024-01-10'),
+    (1003, 3, 'Priya Sharma',   'Coffee Maker',        1, 129.99, 129.99, 'SHIPPED',   '2024-01-11'),
+    (1004, 4, 'Carlos Mendez',  'Python Book',         3,  49.99, 149.97, 'PENDING',   '2024-01-11'),
+    (1005, 5, 'Yuki Tanaka',    'Yoga Mat',            2,  39.99,  79.98, 'DELIVERED', '2024-01-12'),
+    (1006, 6, 'Sophie Dubois',  'Standing Desk',       1, 499.99, 499.99, 'CONFIRMED', '2024-01-12');
+```
+
+Check the stream — all 6 rows show as `INSERT`:
+```sql
+SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM;
+```
+
+Trigger and verify:
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+SELECT order_id, customer_name, status, total_amount FROM ECOMM_DB.RAW_DATA.ORDERS_RAW  ORDER BY order_id;
+SELECT order_id, customer_name, status, is_deleted   FROM ECOMM_DB.STAGING.STG_ORDERS   ORDER BY order_id;
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+```
+
+**Expected mart:**
+
+| order_date | total_orders | confirmed | shipped | delivered | total_revenue |
+|---|---|---|---|---|---|
+| 2024-01-10 | 2 | 2 | 0 | 0 | 329.97 |
+| 2024-01-11 | 2 | 0 | 1 | 0 | 279.96 |
+| 2024-01-12 | 2 | 1 | 0 | 1 | 579.97 |
+
+---
+
+### Batch 2 — Status updates (3 orders change status)
+
+```sql
+-- Bob's shoes shipped
+UPDATE ORDERS_RAW SET status = 'SHIPPED',   updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1002;
+-- Priya's maker delivered
+UPDATE ORDERS_RAW SET status = 'DELIVERED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1003;
+-- Carlos cancelled his order
+UPDATE ORDERS_RAW SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1004;
+```
+
+Check the stream — each UPDATE produces 2 rows (pre/post image):
+```sql
+SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
+ORDER BY order_id, METADATA$ACTION DESC;
+-- 6 rows total: DELETE+INSERT for each of 1002, 1003, 1004
+```
+
+Trigger and verify:
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+SELECT order_id, customer_name, status, is_deleted FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+```
+
+**Expected mart changes:**
+
+| order_date | confirmed | shipped | delivered | cancelled |
+|---|---|---|---|---|
+| 2024-01-10 | 1 | 1 | 0 | 0 | ← Bob moved to SHIPPED |
+| 2024-01-11 | 0 | 0 | 1 | 1 | ← Priya DELIVERED, Carlos CANCELLED |
+
+---
+
+### Batch 3 — Hard delete (remove Carlos from RAW)
+
+```sql
+DELETE FROM ORDERS_RAW WHERE order_id = 1004;
+```
+
+Check the stream — single row, `METADATA$ACTION = 'DELETE'`, `METADATA$ISUPDATE = FALSE`:
+```sql
+SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM;
+```
+
+Trigger and verify:
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+-- RAW: 5 rows (Carlos removed)
+SELECT COUNT(*) AS raw_count FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+
+-- STAGING: still 6 rows — Carlos is soft-deleted, not removed
+SELECT order_id, customer_name, status, is_deleted FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
+
+-- MART: Jan 11 drops to 1 order (Carlos excluded by is_deleted = TRUE)
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+```
+
+---
+
+### Batch 4 — Mixed: new inserts + updates in one task run
+
+```sql
+-- New orders on Jan 13
+INSERT INTO ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date)
+VALUES
+    (1007, 7, 'Marco Rossi', 'Mechanical Keyboard',  1, 189.99, 189.99, 'CONFIRMED', '2024-01-13'),
+    (1008, 8, 'Aisha Patel', 'Smart Watch',          1, 299.99, 299.99, 'PENDING',   '2024-01-13'),
+    (1009, 9, 'Lena Müller', 'Noise Cancelling Mic', 1,  79.99,  79.99, 'CONFIRMED', '2024-01-13');
+
+-- Alice's headphones shipped
+UPDATE ORDERS_RAW SET status = 'SHIPPED',   updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1001;
+-- Sophie's desk delivered
+UPDATE ORDERS_RAW SET status = 'DELIVERED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1006;
+```
+
+Check the stream — 7 rows (3 inserts + 2×2 for the two updates):
+```sql
+SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM
+ORDER BY order_id, METADATA$ACTION DESC;
+```
+
+Trigger and verify:
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+-- 9 rows in staging (6 original + 3 new); Carlos still soft-deleted
+SELECT order_id, customer_name, status, is_deleted FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
+
+-- Jan 13 appears as a new mart row
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+```
+
+---
+
+### Batch 5 — Quantity and price correction
+
+```sql
+-- Lena ordered 2 mics, not 1 — fix quantity and recalculate total
+UPDATE ORDERS_RAW
+SET quantity = 2, total_amount = 159.98, updated_at = CURRENT_TIMESTAMP()
+WHERE order_id = 1009;
+
+-- Aisha's watch confirmed
+UPDATE ORDERS_RAW SET status = 'CONFIRMED', updated_at = CURRENT_TIMESTAMP() WHERE order_id = 1008;
+```
+
+Trigger and verify:
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+-- Lena: quantity=2, total_amount=159.98  |  Aisha: status=CONFIRMED
+SELECT order_id, customer_name, quantity, total_amount, status
+FROM ECOMM_DB.STAGING.STG_ORDERS WHERE order_id IN (1008, 1009);
+
+-- Jan 13: revenue increases, confirmed_orders = 3
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART WHERE order_date = '2024-01-13';
+```
+
+---
+
+### Full consistency check (run after any batch)
+
+```sql
+-- Row counts: RAW must equal active STAGING rows
+SELECT
+    (SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW)                         AS raw_count,
+    (SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS WHERE is_deleted = FALSE)  AS stg_active,
+    (SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS WHERE is_deleted = TRUE)   AS stg_deleted;
+
+-- Revenue: active STAGING must equal MART total
+SELECT
+    (SELECT SUM(total_amount)  FROM ECOMM_DB.STAGING.STG_ORDERS WHERE is_deleted = FALSE) AS stg_revenue,
+    (SELECT SUM(total_revenue) FROM ECOMM_DB.MARTS.ORDERS_MART)                            AS mart_revenue;
+
+-- Task history
+SELECT name, state, scheduled_time, completed_time, error_message
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+    SCHEDULED_TIME_RANGE_START => DATEADD('hours', -2, CURRENT_TIMESTAMP())
+))
+ORDER BY scheduled_time DESC;
+```
+
+---
+
 ## Summary
 
 | Layer | Table | How it gets data |
