@@ -1,11 +1,33 @@
 # Day 5 — Stages, COPY INTO, Snowpipe, and Zero-Copy Cloning
 
-## What You Will Learn
+## Context — Continuing from Day 4
 
-1. **Stages** — Where Snowflake stores files before loading. Internal (Snowflake-managed) and External (your cloud storage).
-2. **COPY INTO** — Bulk-load files from a stage into a table. Manual, batch, uses your warehouse.
-3. **Snowpipe** — Automatic, continuous file ingestion. Serverless, event-driven, no scheduler needed.
-4. **Zero-Copy Cloning** — Instant copy of a table/schema/database with zero storage cost.
+Day 4 built this pipeline:
+```
+ORDERS_RAW  ──[stream]──►  STG_ORDERS  ──────────►  ORDERS_MART
+              RAW_TO_STG_TASK (root, 1 min)
+              STG_TO_MART_TASK (child, after root)
+```
+
+Day 5 adds the **ingestion layer** in front of that pipeline. Instead of inserting rows manually with `INSERT INTO`, we load data from CSV files using a Stage + COPY INTO + Snowpipe. The Day 4 stream and tasks take over from there — nothing in Day 4 changes.
+
+```
+CSV files  ──►  Internal Stage  ──►  COPY INTO / Snowpipe  ──►  ORDERS_RAW
+                                                                      │
+                                                              [Day 4 takes over]
+                                                                      │
+                                                                STG_ORDERS
+                                                                      │
+                                                                ORDERS_MART
+```
+
+**Tables used throughout Day 5 — all from Day 4, no new schemas:**
+
+| Table | Schema |
+|---|---|
+| `ORDERS_RAW` | `ECOMM_DB.RAW_DATA` |
+| `STG_ORDERS` | `ECOMM_DB.STAGING` |
+| `ORDERS_MART` | `ECOMM_DB.MARTS` |
 
 ---
 
@@ -15,99 +37,69 @@
 
 A **Stage** is a Snowflake object that points to a file storage location. Files must land in a stage before Snowflake can load them into a table.
 
-Think of a stage as a **landing zone** — your files arrive here first, then COPY INTO or Snowpipe moves the data into a table.
+Think of it as a **landing zone** — your CSV / JSON / Parquet files arrive here first, then `COPY INTO` or Snowpipe moves the data into a table.
 
 ```
-Your files  ──►  Stage (landing zone)  ──►  Snowflake Table
+Your CSV files  ──►  Stage (landing zone)  ──►  ORDERS_RAW table
 ```
-
-Stages do **not** store Snowflake table data. They store raw files — CSV, JSON, Parquet, Avro, etc.
 
 ### Two Types of Stage
 
 #### Internal Stage (Snowflake-managed storage)
 
-Snowflake hosts the storage for you. No cloud bucket, no credentials to manage.
+Snowflake hosts the storage for you. No cloud bucket, no credentials to manage. Three sub-types:
 
-Three sub-types:
-
-| Sub-type | Scope | Auto-created? | Use |
+| Sub-type | Reference | Auto-created? | Use |
 |---|---|---|---|
-| User stage | Per user (`@~`) | Yes | Quick personal uploads |
-| Table stage | Per table (`@%table_name`) | Yes | Load files directly into one table |
-| Named stage | You create it | No | Shared, reusable, recommended for pipelines |
+| User stage | `@~` | Yes | Private to current user |
+| Table stage | `@%table_name` | Yes | Tied to one specific table |
+| Named stage | `@schema.stage_name` | No — you create it | Shared, reusable — use this in real pipelines |
 
-**Named stage** is what you will use in almost every real scenario.
+**Named stage** is what you create and control. It is the right choice for any pipeline that multiple people or processes need to use.
 
-#### External Stage (cloud storage you own)
+#### External Stage (your cloud storage)
 
-Snowflake reads from your own S3 bucket, Azure Blob / ADLS, or GCS container. You provide the credentials. The files stay in your cloud storage — Snowflake never copies them in.
+Snowflake reads from your own S3 bucket, Azure ADLS, or GCS container. You provide the URL and credentials. Files stay in your cloud storage — Snowflake never copies them in.
 
 ```sql
--- External stage example (definition only — requires your cloud credentials)
+-- External stage — definition only, requires cloud credentials
 CREATE STAGE my_s3_stage
     URL                 = 's3://my-bucket/orders/'
     STORAGE_INTEGRATION = my_s3_integration;
 ```
 
-> External stages require a **Storage Integration** (an OAuth trust between Snowflake and your cloud) — covered when you set up cloud-specific pipelines. For today's hands-on, we use **internal named stages** — no cloud credentials needed.
+> External stages need a **Storage Integration** (OAuth trust between Snowflake and your cloud). We use **internal named stages** for today — no cloud credentials needed.
 
 ---
 
-### Hands-On: Internal Named Stage
-
-#### Step 1: Create a named internal stage
+### Hands-On: Create a Named Internal Stage on ORDERS_RAW
 
 ```sql
 USE ROLE SYSADMIN;
 USE WAREHOUSE COMPUTE_WH;
-USE DATABASE ECOMM_DB;
-USE SCHEMA RAW_DATA;
+USE SCHEMA ECOMM_DB.RAW_DATA;
 
--- Create a named internal stage with CSV file format
-CREATE OR REPLACE STAGE ORDERS_STAGE
+-- Create a named internal stage matching the ORDERS_RAW column structure
+CREATE OR REPLACE STAGE ORDERS_RAW_STAGE
     FILE_FORMAT = (
         TYPE                         = 'CSV'
         SKIP_HEADER                  = 1
         FIELD_OPTIONALLY_ENCLOSED_BY = '"'
         NULL_IF                      = ('NULL', 'null', '')
     )
-    COMMENT = 'Internal stage for order CSV files';
+    COMMENT = 'Internal stage for loading order CSV files into ORDERS_RAW';
 ```
 
-#### Step 2: Inspect the stage
+Inspect it:
 
 ```sql
--- List all stages in this schema
 SHOW STAGES IN SCHEMA ECOMM_DB.RAW_DATA;
 
--- Check the stage definition
-DESC STAGE ECOMM_DB.RAW_DATA.ORDERS_STAGE;
-```
+-- See the full definition
+DESC STAGE ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE;
 
-#### Step 3: Upload a file to the stage
-
-> In Snowsight: go to **Data → Databases → ECOMM_DB → RAW_DATA → Stages → ORDERS_STAGE** and use the upload button.
->
-> With SnowSQL CLI: `PUT file:///path/to/orders.csv @ECOMM_DB.RAW_DATA.ORDERS_STAGE;`
-
-Create a local file called `orders_batch1.csv` with this content (copy-paste into a text file):
-
-```
-order_id,customer_name,product,quantity,unit_price,total_amount,status,order_date
-1001,Alice Johnson,Wireless Headphones,1,149.99,149.99,CONFIRMED,2024-01-10
-1002,Bob Smith,Running Shoes,2,89.99,179.98,CONFIRMED,2024-01-10
-1003,Priya Sharma,Coffee Maker,1,129.99,129.99,SHIPPED,2024-01-11
-1004,Carlos Mendez,Python Book,3,49.99,149.97,PENDING,2024-01-11
-1005,Yuki Tanaka,Yoga Mat,2,39.99,79.98,DELIVERED,2024-01-12
-```
-
-#### Step 4: Verify the file is in the stage
-
-```sql
--- List files currently in the stage
-LIST @ECOMM_DB.RAW_DATA.ORDERS_STAGE;
--- You should see: orders_batch1.csv.gz  (Snowflake auto-compresses on upload)
+-- Confirm it is currently empty
+LIST @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE;
 ```
 
 ---
@@ -116,129 +108,167 @@ LIST @ECOMM_DB.RAW_DATA.ORDERS_STAGE;
 
 ### What is COPY INTO?
 
-`COPY INTO` loads files from a stage into a Snowflake table. It is a **manual, batch command** — you run it when you want to load. It uses your virtual warehouse.
+`COPY INTO` reads files from a stage and bulk-loads them into a Snowflake table. It is a **manual, batch command** — you run it when you want to load. It uses your virtual warehouse.
 
 ```
-Stage  ──►  COPY INTO  ──►  Table
+Stage  ──►  COPY INTO  ──►  ORDERS_RAW
 ```
 
 ### Key behaviors
 
-- **Deduplication built-in:** Tracks which files it has already loaded (64-day metadata window). Re-running COPY INTO on the same file does NOT create duplicate rows.
-- **Atomic per file:** Each file load is all-or-nothing. If a file fails halfway, no partial rows are inserted.
-- **Transformation at load time:** You can cast, rename, or reorder columns inline using a SELECT in the COPY INTO.
+- **Deduplication built-in** — tracks loaded files by name + size + last-modified. Re-running COPY INTO on the same file does NOT insert duplicate rows.
+- **Atomic per file** — if a file fails halfway, zero rows from that file are inserted.
+- **Transformation at load time** — cast, rename, or reorder columns inline using a SELECT.
 
-### Hands-On: COPY INTO
+---
 
-#### Step 1: Create the target table
+### Hands-On: COPY INTO ORDERS_RAW
+
+#### Step 1: Prepare your CSV file
+
+Create a local file called `orders_batch1.csv` with this content:
+
+```
+order_id,customer_id,customer_name,product,quantity,unit_price,total_amount,status,order_date
+1001,1,Alice Johnson,Wireless Headphones,1,149.99,149.99,CONFIRMED,2024-01-10
+1002,2,Bob Smith,Running Shoes,2,89.99,179.98,CONFIRMED,2024-01-10
+1003,3,Priya Sharma,Coffee Maker,1,129.99,129.99,SHIPPED,2024-01-11
+1004,4,Carlos Mendez,Python Book,3,49.99,149.97,PENDING,2024-01-11
+1005,5,Yuki Tanaka,Yoga Mat,2,39.99,79.98,DELIVERED,2024-01-12
+```
+
+#### Step 2: Upload the file to the stage
+
+**Snowsight UI:** Data → Databases → ECOMM_DB → RAW_DATA → Stages → ORDERS_RAW_STAGE → Upload button
+
+**SnowSQL CLI:** `PUT file:///path/to/orders_batch1.csv @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE;`
+
+Confirm it landed:
+
+```sql
+LIST @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE;
+-- Should show: orders_batch1.csv.gz  (Snowflake auto-compresses on upload)
+```
+
+#### Step 3: Run COPY INTO to load into ORDERS_RAW
 
 ```sql
 USE SCHEMA ECOMM_DB.RAW_DATA;
 
-CREATE OR REPLACE TABLE ORDERS_RAW_LOAD (
-    order_id      NUMBER,
-    customer_name VARCHAR(200),
-    product       VARCHAR(200),
-    quantity      NUMBER,
-    unit_price    NUMBER(10,2),
-    total_amount  NUMBER(10,2),
-    status        VARCHAR(50),
-    order_date    DATE
-);
-```
-
-#### Step 2: Load the file from the stage
-
-```sql
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD
-FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
+COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity,
+     unit_price, total_amount, status, order_date)
+FROM @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE
 FILE_FORMAT = (
     TYPE                         = 'CSV'
     SKIP_HEADER                  = 1
     FIELD_OPTIONALLY_ENCLOSED_BY = '"'
 );
+-- Output: status = LOADED, rows_loaded = 5, errors_seen = 0
 ```
 
-Output shows: file name, status (`LOADED`), rows loaded, rows with errors.
+> We explicitly name the target columns and skip `updated_at` — it uses `DEFAULT CURRENT_TIMESTAMP()` automatically.
 
-#### Step 3: Verify
+#### Step 4: Verify ORDERS_RAW has the data
 
 ```sql
-SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD ORDER BY order_id;
--- Expected: 5 rows
+SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RAW ORDER BY order_id;
+-- 5 rows
 
-SELECT COUNT(*) AS row_count FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
 ```
 
-#### Step 4: Try loading the same file again — observe deduplication
+#### Step 5: The Day 4 stream captured these inserts automatically
 
 ```sql
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD
-FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
+-- Check the stream — should have 5 INSERT rows
+SELECT order_id, customer_name, status, METADATA$ACTION, METADATA$ISUPDATE
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_STREAM;
+-- All 5 rows show ACTION = 'INSERT', ISUPDATE = FALSE
+```
+
+#### Step 6: Trigger the Day 4 task to propagate to STAGING and MART
+
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+-- Wait ~10 seconds, then verify all three layers
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;      -- 5
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;        -- 5
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+-- 3 mart rows: Jan 10, Jan 11, Jan 12
+```
+
+#### Step 7: Run COPY INTO again on the same file — observe deduplication
+
+```sql
+COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity,
+     unit_price, total_amount, status, order_date)
+FROM @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE
 FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+-- Status: LOAD_SKIPPED — file already loaded, no duplicate rows inserted
 
--- Status: LOAD_SKIPPED — file already loaded, dedup protection kicked in
--- Row count: still 5
-
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+-- Still 5
 ```
 
-#### Step 5: Force reload (bypass dedup — useful for testing)
+#### Step 8: Load a second batch
 
-```sql
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD
-FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
-FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1)
-FORCE = TRUE;  -- ignores the dedup metadata, loads again
+Create `orders_batch2.csv`:
 
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD;
--- Now 10 rows (5 original + 5 duplicated) — this is why FORCE = TRUE is for testing only
+```
+order_id,customer_id,customer_name,product,quantity,unit_price,total_amount,status,order_date
+1006,6,Sophie Dubois,Standing Desk,1,499.99,499.99,CONFIRMED,2024-01-12
+1007,7,Marco Rossi,Mechanical Keyboard,1,189.99,189.99,CONFIRMED,2024-01-13
+1008,8,Aisha Patel,Smart Watch,1,299.99,299.99,PENDING,2024-01-13
 ```
 
-#### Step 6: Load specific files only
+Upload to `ORDERS_RAW_STAGE`, then:
 
 ```sql
--- Load only one specific file from the stage
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD
-FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
-FILES = ('orders_batch1.csv.gz')
+COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity,
+     unit_price, total_amount, status, order_date)
+FROM @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE
 FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1);
+-- batch1: LOAD_SKIPPED  |  batch2: LOADED (3 rows)
+
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+-- 8 rows
+
+-- Trigger tasks to push new rows through to STAGING and MART
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+-- Verify
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 ```
 
-#### Step 7: Check load history
+#### Step 9: Check load history
 
 ```sql
-SELECT *
+SELECT file_name, row_count, status, last_load_time
 FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
-    TABLE_NAME  => 'ORDERS_RAW_LOAD',
+    TABLE_NAME  => 'ORDERS_RAW',
     START_TIME  => DATEADD('hours', -1, CURRENT_TIMESTAMP())
 ))
 ORDER BY LAST_LOAD_TIME DESC;
 ```
 
-#### Step 8: Load with inline transformation
+---
 
-```sql
--- Load only specific columns and add a loaded_at timestamp
-CREATE OR REPLACE TABLE ORDERS_RAW_LOAD (
-    order_id      NUMBER,
-    customer_name VARCHAR(200),
-    product       VARCHAR(200),
-    total_amount  NUMBER(10,2),
-    status        VARCHAR(50),
-    loaded_at     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
+## Key Properties — COPY INTO vs Task + COPY INTO vs Snowpipe
 
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD (order_id, customer_name, product, total_amount, status)
-FROM (
-    SELECT $1, $2, $3, $6, $7   -- column positions from the CSV ($1 = first column)
-    FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
-)
-FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1)
-FORCE = TRUE;
-
-SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD;
-```
+| Property | COPY INTO (manual) | Task + COPY INTO | Snowpipe |
+|---|---|---|---|
+| **Trigger** | You run it manually | Fixed schedule (min 1 min) | File arrival or REST API call |
+| **Compute** | Your virtual warehouse | Your virtual warehouse | Snowflake-managed (serverless) |
+| **Latency** | On demand | Up to 1 minute + startup | Seconds to ~1 minute |
+| **Idle cost** | Zero | Warehouse may bill while idle | Zero — no files = no compute |
+| **Duplicate prevention** | Built-in (64-day window) | You must handle it | Built-in (file metadata tracking) |
+| **Cost model** | Warehouse credits | Warehouse credits | Per-second of serverless compute |
+| **Best for** | One-time / ad-hoc loads | Scheduled micro-batches | Continuous file streaming |
 
 ---
 
@@ -246,65 +276,38 @@ SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_LOAD;
 
 ### What is Snowpipe?
 
-Snowpipe is Snowflake's **automatic, continuous file ingestion** service. Instead of you running `COPY INTO` manually or on a schedule, Snowpipe monitors a stage and loads files **as they arrive**.
+Snowpipe is Snowflake's **automatic, continuous file ingestion** service. You create a **Pipe** object — which stage to watch and what COPY INTO to run — and Snowpipe runs it automatically whenever new files arrive.
 
 ```
-File lands in stage  ──►  Snowpipe detects it  ──►  COPY INTO runs automatically
+File lands in stage  ──►  Snowpipe detects it  ──►  COPY INTO ORDERS_RAW  ──►  [Day 4 stream + tasks kick in]
 ```
 
-You define a **Pipe** object — which stage to watch and what COPY INTO to run. Snowpipe handles the rest.
+**Two trigger modes:**
 
-### Key Properties — Snowpipe vs COPY INTO vs Task+COPY INTO
+| Mode | How it works |
+|---|---|
+| **REST API / REFRESH** | You call the Snowpipe REST endpoint or run `ALTER PIPE ... REFRESH` to trigger a scan |
+| **Auto-Ingest** | Cloud storage fires an event (S3 SNS / Azure Event Grid / GCS Pub/Sub) → Snowpipe picks it up automatically |
 
-| Property | COPY INTO (manual) | Task + COPY INTO | Snowpipe |
-|---|---|---|---|
-| **Trigger** | You run it manually | Fixed schedule (min 1 min) | File arrival or REST API call |
-| **Compute** | Your virtual warehouse | Your virtual warehouse | Snowflake-managed (serverless) |
-| **Latency** | On demand — whenever you run | Up to 1 minute + startup | Seconds to ~1 minute |
-| **Idle cost** | Zero (you only run when needed) | Warehouse may bill while idle | Zero — no files = no compute |
-| **Duplicate prevention** | Built-in (64-day window) | You must handle it | Built-in (tracks file metadata) |
-| **Cost model** | Warehouse credits | Warehouse credits | Per-second of serverless compute |
-| **Best for** | One-time / ad-hoc loads | Scheduled micro-batches | Continuous file streaming |
-
-### Two Trigger Modes
-
-| Mode | How it works | When to use |
-|---|---|---|
-| **REST API** | Your app calls the Snowpipe REST endpoint to say "new files arrived" | When your app knows about the files |
-| **Auto-Ingest** | Cloud storage fires an event when a file lands (S3 SNS / Azure Event Grid / GCS Pub/Sub) → Snowpipe reads it automatically | Zero-code, fully automated pipelines |
+We use the `REFRESH` mode — works in Snowsight, no cloud event setup needed.
 
 ---
 
-### Hands-On: Snowpipe (REST / REFRESH mode)
+### Hands-On: Snowpipe into ORDERS_RAW
 
-> We use `ALTER PIPE ... REFRESH` — the Snowsight-compatible way to trigger Snowpipe without needing cloud event infrastructure. This is the same as calling the REST API manually.
-
-#### Step 1: Create the target table
+#### Step 1: Create the pipe
 
 ```sql
 USE SCHEMA ECOMM_DB.RAW_DATA;
 
-CREATE OR REPLACE TABLE ORDERS_PIPE_LOAD (
-    order_id      NUMBER,
-    customer_name VARCHAR(200),
-    product       VARCHAR(200),
-    quantity      NUMBER,
-    unit_price    NUMBER(10,2),
-    total_amount  NUMBER(10,2),
-    status        VARCHAR(50),
-    order_date    DATE
-);
-```
-
-#### Step 2: Create the Pipe
-
-```sql
-CREATE OR REPLACE PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE
-    AUTO_INGEST = FALSE   -- we trigger manually; set TRUE for event-driven
-    COMMENT     = 'Loads CSV files from ORDERS_STAGE into ORDERS_PIPE_LOAD'
+CREATE OR REPLACE PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE
+    AUTO_INGEST = FALSE
+    COMMENT     = 'Loads CSV files from ORDERS_RAW_STAGE into ORDERS_RAW'
 AS
-COPY INTO ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD
-FROM @ECOMM_DB.RAW_DATA.ORDERS_STAGE
+COPY INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity,
+     unit_price, total_amount, status, order_date)
+FROM @ECOMM_DB.RAW_DATA.ORDERS_RAW_STAGE
 FILE_FORMAT = (
     TYPE                         = 'CSV'
     SKIP_HEADER                  = 1
@@ -312,107 +315,95 @@ FILE_FORMAT = (
 );
 ```
 
-The `AS` clause is a standard COPY INTO. Snowpipe runs this automatically every time it is triggered.
-
-#### Step 3: Check pipe status
+#### Step 2: Check pipe status
 
 ```sql
 SHOW PIPES IN DATABASE ECOMM_DB;
 
--- Detailed status
-SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_PIPE');
+SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE');
 -- Look for: "executionState": "RUNNING"
 ```
 
-#### Step 4: Confirm file is in the stage
+#### Step 3: Upload a new batch file
 
-```sql
-LIST @ECOMM_DB.RAW_DATA.ORDERS_STAGE;
--- orders_batch1.csv.gz should be there from earlier
+Create `orders_batch3.csv`:
+
+```
+order_id,customer_id,customer_name,product,quantity,unit_price,total_amount,status,order_date
+1009,9,Lena Müller,Noise Cancelling Mic,1,79.99,79.99,CONFIRMED,2024-01-13
+1010,10,James Lee,USB-C Hub,2,34.99,69.98,SHIPPED,2024-01-14
 ```
 
-#### Step 5: Trigger Snowpipe to scan the stage and load new files
+Upload to `ORDERS_RAW_STAGE`.
+
+#### Step 4: Trigger Snowpipe to scan and load
 
 ```sql
--- Tells Snowpipe: scan the stage and load any files not yet loaded by this pipe
-ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE REFRESH;
+-- Scan the stage — queues new files for loading by this pipe
+ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE REFRESH;
 -- Returns: filesScanned, filesQueued
 
--- Wait 15–20 seconds (serverless compute spins up and loads the file)
+-- Wait 15–20 seconds (serverless compute loads the file)
 ```
 
-#### Step 6: Verify data loaded
+#### Step 5: Verify data reached ORDERS_RAW
 
 ```sql
-SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD ORDER BY order_id;
--- Expected: 5 rows
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+-- Should show 10 (8 from earlier + 2 from batch3)
 
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
+SELECT order_id, customer_name, product, status
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id IN (1009, 1010);
 ```
 
-#### Step 7: Check load history
+#### Step 6: Trigger the Day 4 task to push through the pipeline
+
+```sql
+EXECUTE TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK;
+
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;
+-- 10 rows
+
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
+-- Jan 13 and Jan 14 now appear
+```
+
+#### Step 7: Test Snowpipe deduplication
+
+```sql
+-- Trigger REFRESH again — same files are already loaded
+ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE REFRESH;
+
+-- Wait 20 seconds
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+-- Still 10 — Snowpipe does not reload already-loaded files
+```
+
+#### Step 8: Pause and resume the pipe
+
+```sql
+ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE SET PIPE_EXECUTION_PAUSED = TRUE;
+
+SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE');
+-- "executionState": "PAUSED"
+
+-- Resume
+ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE SET PIPE_EXECUTION_PAUSED = FALSE;
+
+SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE');
+-- "executionState": "RUNNING"
+```
+
+#### Step 9: Check load history
 
 ```sql
 SELECT file_name, row_count, status, last_load_time
 FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
-    TABLE_NAME  => 'ORDERS_PIPE_LOAD',
-    START_TIME  => DATEADD('minutes', -10, CURRENT_TIMESTAMP())
+    TABLE_NAME  => 'ORDERS_RAW',
+    START_TIME  => DATEADD('hours', -1, CURRENT_TIMESTAMP())
 ))
 ORDER BY LAST_LOAD_TIME DESC;
-```
-
-#### Step 8: Upload a second batch and load it
-
-Create `orders_batch2.csv`:
-```
-order_id,customer_name,product,quantity,unit_price,total_amount,status,order_date
-1006,Sophie Dubois,Standing Desk,1,499.99,499.99,CONFIRMED,2024-01-12
-1007,Marco Rossi,Mechanical Keyboard,1,189.99,189.99,CONFIRMED,2024-01-13
-1008,Aisha Patel,Smart Watch,1,299.99,299.99,PENDING,2024-01-13
-```
-
-Upload it to `ORDERS_STAGE`, then:
-
-```sql
-ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE REFRESH;
-
--- Wait 15–20 seconds
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
--- Expected: 8
-
--- Load history shows 2 files now
-SELECT file_name, row_count, status
-FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
-    TABLE_NAME  => 'ORDERS_PIPE_LOAD',
-    START_TIME  => DATEADD('minutes', -30, CURRENT_TIMESTAMP())
-))
-ORDER BY LAST_LOAD_TIME DESC;
-```
-
-#### Step 9: Test deduplication — trigger REFRESH again without new files
-
-```sql
-ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE REFRESH;
-
--- Wait 20 seconds
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
--- Still 8 — Snowpipe tracks loaded files, does not reload them
-```
-
-#### Step 10: Pause and resume the pipe
-
-```sql
--- Pause: stops loading new files
-ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE SET PIPE_EXECUTION_PAUSED = TRUE;
-
-SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_PIPE');
--- "executionState": "PAUSED"
-
--- Resume
-ALTER PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE SET PIPE_EXECUTION_PAUSED = FALSE;
-
-SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_PIPE');
--- "executionState": "RUNNING"
 ```
 
 ---
@@ -423,164 +414,158 @@ SELECT SYSTEM$PIPE_STATUS('ECOMM_DB.RAW_DATA.ORDERS_PIPE');
 
 Cloning creates an **instant copy** of a table, schema, or database that **costs zero extra storage** at clone time. The clone and the source share the same underlying data blocks — no bytes are duplicated.
 
-```
-CREATE DATABASE DEV CLONE PROD;
--- Runs in milliseconds regardless of PROD's size.
+```sql
+CREATE DATABASE ECOMM_DB_DEV CLONE ECOMM_DB;
+-- Runs in milliseconds regardless of size.
 -- Storage cost at clone time: ZERO
 ```
 
-This uses **Copy-on-Write (CoW)**: the clone is a new metadata pointer to the same physical blocks. New storage is only allocated when either the source or the clone is **modified** — and only for the changed blocks.
+This uses **Copy-on-Write (CoW)**: both the original and clone point to the same physical blocks. New storage is only allocated when either side is **modified** — and only for the changed blocks.
 
 ```
 After cloning:
-  PROD ──► [Block A] [Block B] [Block C]
-  DEV  ──► [Block A] [Block B] [Block C]   ← same blocks, zero extra storage
+  ORDERS_RAW        ──► [Block A] [Block B] [Block C]
+  ORDERS_RAW_BACKUP ──► [Block A] [Block B] [Block C]   ← same blocks, zero extra storage
 
-After deleting old rows from DEV:
-  PROD ──► [Block A] [Block B] [Block C]   ← untouched
-  DEV  ──► [Block A*] [Block B] [Block C]  ← only the modified partition is new
+After deleting rows from ORDERS_RAW_BACKUP:
+  ORDERS_RAW        ──► [Block A] [Block B] [Block C]   ← untouched
+  ORDERS_RAW_BACKUP ──► [Block A*] [Block B] [Block C]  ← only the changed partition is new
 ```
 
 ### What can be cloned?
 
 | Object | Example |
 |---|---|
-| Table | `CREATE TABLE orders_backup CLONE orders_raw` |
-| Schema | `CREATE SCHEMA staging_backup CLONE staging` |
-| Database | `CREATE DATABASE ecomm_dev CLONE ecomm_db` |
-| Stage | `CREATE STAGE stg2 CLONE stg1` |
+| Table | `CREATE TABLE t2 CLONE t1` |
+| Schema | `CREATE SCHEMA s2 CLONE s1` |
+| Database | `CREATE DATABASE db2 CLONE db1` |
 | Streams / Tasks | Cannot be cloned |
 
 ### Real-world use cases
 
-| Scenario | Why cloning |
+| Scenario | Why |
 |---|---|
-| Dev/test environment | Clone prod → developers get real data, zero storage cost |
+| Dev/test environment | Clone prod DB → real data, zero storage cost |
 | Pre-migration backup | Clone before a risky `ALTER TABLE` or bulk `UPDATE` |
-| Disaster recovery | Accidentally deleted rows? Clone at a past point in time and restore |
-| Data science sandbox | Each analyst gets their own clone — modify freely, no impact on prod |
+| Disaster recovery | Accidentally deleted rows? Clone at a past point in time |
+| Data science sandbox | Each analyst gets their own clone — modify freely, no prod impact |
 
 ---
 
-### Hands-On: Zero-Copy Cloning
+### Hands-On: Zero-Copy Cloning on Day 4 Tables
 
-#### Step 1: Clone a single table
+#### Step 1: Clone ORDERS_RAW
 
 ```sql
 USE SCHEMA ECOMM_DB.RAW_DATA;
 
--- Make sure we have data in the source table
-SELECT COUNT(*) FROM ORDERS_PIPE_LOAD;
+-- Confirm source has data
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
 
--- Clone it
-CREATE TABLE ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP
-    CLONE ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
+-- Clone it instantly
+CREATE TABLE ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP
+    CLONE ECOMM_DB.RAW_DATA.ORDERS_RAW;
 
--- Verify both have the same row count
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP;
--- Both should return the same number
+-- Both have the same count — zero extra storage right now
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP;
 ```
 
-#### Step 2: Verify clone isolation — changes to source do not affect clone
+#### Step 2: Verify isolation — source changes do not affect clone
 
 ```sql
--- Insert a new row into the SOURCE table
-INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD
-VALUES (9999, 'Test User', 'Test Product', 1, 50.00, 50.00, 'PENDING', '2024-01-15');
+-- Insert a new row into ORDERS_RAW
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date)
+VALUES (9999, 99, 'Test User', 'Test Product', 1, 50.00, 50.00, 'PENDING', '2024-01-15');
 
 -- Source: has the new row
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;        -- +1
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;        -- +1
 
--- Clone: does NOT have it — it was cloned before this insert
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP; -- same as before
+-- Clone: does NOT have it
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP; -- unchanged
 ```
 
-#### Step 3: Verify clone isolation — changes to clone do not affect source
+#### Step 3: Verify isolation — clone changes do not affect source
 
 ```sql
--- Delete from the CLONE
-DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP
+-- Delete some rows from the CLONE
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP
 WHERE order_id <= 1003;
 
 -- Clone: fewer rows
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP;
 
 -- Source: completely unaffected
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
 ```
 
-#### Step 4: Clone a schema
+#### Step 4: Clone the entire database (all schemas + tables at once)
 
 ```sql
--- Clone the entire RAW_DATA schema — all tables inside are cloned
-CREATE SCHEMA ECOMM_DB.RAW_DATA_BACKUP
-    CLONE ECOMM_DB.RAW_DATA;
+-- Clone ECOMM_DB — creates ECOMM_DB_DEV with all schemas:
+-- RAW_DATA, STAGING, MARTS — all tables cloned, all data accessible instantly
+CREATE DATABASE ECOMM_DB_DEV CLONE ECOMM_DB;
 
--- See all tables in the cloned schema
-SHOW TABLES IN SCHEMA ECOMM_DB.RAW_DATA_BACKUP;
--- You should see ORDERS_PIPE_LOAD, ORDERS_RAW_LOAD, etc. — all cloned instantly
+-- Verify all schemas exist in the clone
+SHOW SCHEMAS IN DATABASE ECOMM_DB_DEV;
+
+-- Verify data is there
+SELECT COUNT(*) FROM ECOMM_DB_DEV.RAW_DATA.ORDERS_RAW;
+SELECT COUNT(*) FROM ECOMM_DB_DEV.STAGING.STG_ORDERS;
+SELECT COUNT(*) FROM ECOMM_DB_DEV.MARTS.ORDERS_MART;
+-- All match the source counts at clone time
 ```
 
-#### Step 5: Clone at a point in time (Time Travel clone) — disaster recovery
+#### Step 5: Time Travel clone — disaster recovery on ORDERS_RAW
 
 ```sql
 USE SCHEMA ECOMM_DB.RAW_DATA;
 
--- Step 1: Note the current row count
-SELECT COUNT(*) FROM ORDERS_PIPE_LOAD;
+-- Step 1: Note current row count
+SELECT COUNT(*) FROM ORDERS_RAW;
 
--- Step 2: Simulate an accidental delete
-DELETE FROM ORDERS_PIPE_LOAD WHERE order_id > 1005;
+-- Step 2: Accidental delete
+DELETE FROM ORDERS_RAW WHERE order_id > 1005;
+SELECT COUNT(*) FROM ORDERS_RAW;
+-- Rows are gone!
 
-SELECT COUNT(*) FROM ORDERS_PIPE_LOAD;
--- Rows are gone — disaster!
-
--- Step 3: Find the query ID of the bad delete
+-- Step 3: Find the bad query ID from history
 SELECT query_id, query_text, start_time
 FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
     DATE_RANGE_START => DATEADD('minutes', -5, CURRENT_TIMESTAMP())
 ))
-WHERE query_text ILIKE '%DELETE%ORDERS_PIPE_LOAD%'
+WHERE query_text ILIKE '%DELETE%ORDERS_RAW%'
 ORDER BY start_time DESC
 LIMIT 1;
--- Copy the query_id value from the result
+-- Copy the query_id
 
--- Step 4: Clone the table as it was BEFORE that exact query
-CREATE TABLE ECOMM_DB.RAW_DATA.ORDERS_RECOVERED
-    CLONE ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD
-    BEFORE (STATEMENT => '<paste-your-query-id-here>');
+-- Step 4: Clone ORDERS_RAW as it was BEFORE that query
+CREATE TABLE ECOMM_DB.RAW_DATA.ORDERS_RAW_RECOVERED
+    CLONE ECOMM_DB.RAW_DATA.ORDERS_RAW
+    BEFORE (STATEMENT => '<paste-query-id-here>');
 
--- Step 5: Verify the recovered table has all the rows
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RECOVERED;
--- Should match the count before the accidental delete
+-- Step 5: Verify recovered data
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_RECOVERED;
+-- Full count before the accidental delete
 
--- Step 6: Restore the missing rows back into the live table
-INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD
-SELECT * FROM ECOMM_DB.RAW_DATA.ORDERS_RECOVERED r
+-- Step 6: Restore the missing rows
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity,
+     unit_price, total_amount, status, order_date, updated_at)
+SELECT order_id, customer_id, customer_name, product, quantity,
+       unit_price, total_amount, status, order_date, updated_at
+FROM ECOMM_DB.RAW_DATA.ORDERS_RAW_RECOVERED r
 WHERE NOT EXISTS (
-    SELECT 1 FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD s
+    SELECT 1 FROM ECOMM_DB.RAW_DATA.ORDERS_RAW s
     WHERE s.order_id = r.order_id
 );
 
--- Step 7: Verify full count is restored
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD;
+-- Step 7: Verify full count is back
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
 
 -- Step 8: Drop the recovery table
-DROP TABLE ECOMM_DB.RAW_DATA.ORDERS_RECOVERED;
-```
-
-#### Step 6: Clone with a time offset (alternative to BEFORE STATEMENT)
-
-```sql
--- Clone as the table was 10 minutes ago (offset in seconds)
-CREATE TABLE ECOMM_DB.RAW_DATA.ORDERS_10MIN_AGO
-    CLONE ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD
-    AT (OFFSET => -600);  -- 600 seconds = 10 minutes
-
-SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_10MIN_AGO;
-
-DROP TABLE ECOMM_DB.RAW_DATA.ORDERS_10MIN_AGO;
+DROP TABLE ECOMM_DB.RAW_DATA.ORDERS_RAW_RECOVERED;
 ```
 
 ---
@@ -588,29 +573,34 @@ DROP TABLE ECOMM_DB.RAW_DATA.ORDERS_10MIN_AGO;
 ## Teardown
 
 ```sql
--- Drop the pipe (always clean up pipes — they consume background resources)
-DROP PIPE ECOMM_DB.RAW_DATA.ORDERS_PIPE;
+USE ROLE SYSADMIN;
 
--- Drop backup objects
-DROP SCHEMA ECOMM_DB.RAW_DATA_BACKUP;
-DROP TABLE  ECOMM_DB.RAW_DATA.ORDERS_PIPE_LOAD_BACKUP;
+-- Suspend tasks before dropping anything
+ALTER TASK ECOMM_DB.RAW_DATA.RAW_TO_STG_TASK  SUSPEND;
+ALTER TASK ECOMM_DB.RAW_DATA.STG_TO_MART_TASK SUSPEND;
+
+-- Drop the pipe
+DROP PIPE ECOMM_DB.RAW_DATA.ORDERS_RAW_PIPE;
+
+-- Drop backup/dev objects
+DROP TABLE    ECOMM_DB.RAW_DATA.ORDERS_RAW_BACKUP;
+DROP DATABASE ECOMM_DB_DEV;
 
 -- Confirm
-SHOW PIPES  IN DATABASE ECOMM_DB;
-SHOW STAGES IN SCHEMA   ECOMM_DB.RAW_DATA;
+SHOW PIPES IN DATABASE ECOMM_DB;
 ```
 
 ---
 
 ## Summary
 
-| Concept | Key command | Use |
+| Concept | What it does | Key command |
 |---|---|---|
-| Internal Stage | `CREATE STAGE name FILE_FORMAT = (...)` | Landing zone for files |
-| External Stage | `CREATE STAGE name URL='s3://...'` | Point to your own cloud storage |
-| COPY INTO | `COPY INTO table FROM @stage` | Manual bulk load; your warehouse; dedup built-in |
-| Snowpipe | `CREATE PIPE ... AS COPY INTO ...` | Automatic load on file arrival; serverless |
-| Zero-Copy Clone | `CREATE TABLE t2 CLONE t1` | Instant copy; zero storage cost; CoW on writes |
-| Time Travel Clone | `CLONE ... BEFORE (STATEMENT => 'id')` | Recover from accidental deletes/updates |
+| Internal Stage | File landing zone inside Snowflake | `CREATE STAGE ORDERS_RAW_STAGE FILE_FORMAT = (...)` |
+| External Stage | Points to your S3 / ADLS / GCS | `CREATE STAGE ... URL='s3://...'` (definition only) |
+| COPY INTO | Manual bulk load from stage → table | `COPY INTO ORDERS_RAW FROM @ORDERS_RAW_STAGE` |
+| Snowpipe | Auto-load on file arrival, serverless | `CREATE PIPE ... AS COPY INTO ...` |
+| Zero-Copy Clone | Instant copy, zero storage cost | `CREATE TABLE t2 CLONE t1` |
+| Time Travel Clone | Recover from accidental deletes | `CLONE ... BEFORE (STATEMENT => 'query_id')` |
 
 **Next:** Day 6 — Time Travel, Fail-Safe, and Query Optimization.
