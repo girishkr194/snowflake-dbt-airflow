@@ -1,35 +1,35 @@
-# Day 5 — Interview Questions: Snowpipe, ADLS Auto-Ingest, Cloning & Sharing
+# Day 5 — Interview Questions: Stages, COPY INTO, Snowpipe, and Zero-Copy Cloning
 
-> 15 questions covering all three concepts. Difficulty tags: (Warm-up) → (Conceptual) → (Scenario) → (Tricky) → (System design)
+> 15 questions. Difficulty tags: (Warm-up) → (Conceptual) → (Scenario) → (Tricky)
 
 ---
 
-**Q1 (Warm-up)** — What is Snowpipe and how does it differ from a Task that runs `COPY INTO` on a 1-minute schedule?
+**Q1 (Warm-up)** — What is a Stage in Snowflake? Why do you need one before loading data into a table?
 
-**Q2 (Warm-up)** — What does `AUTO_INGEST = TRUE` on a Pipe object mean? What infrastructure component enables it on Azure?
+**Q2 (Warm-up)** — What is the difference between an internal stage and an external stage?
 
-**Q3 (Conceptual)** — Snowpipe is described as "serverless." What exactly does that mean in this context — what compute does it use and how is it billed?
+**Q3 (Conceptual)** — Snowflake has three types of internal stage: user, table, and named. What is the difference between them? Which one should you use in a production pipeline and why?
 
-**Q4 (Conceptual)** — A file is uploaded to the stage twice — once at 10:00 AM and again at 10:05 AM with the same filename but different content. Does Snowpipe load it twice? Why or why not?
+**Q4 (Warm-up)** — What does `COPY INTO` do? What compute resource does it use?
 
-**Q5 (Tricky)** — You set up auto-ingest with Azure Event Grid. Files land in ADLS but `SYSTEM$PIPE_STATUS` shows `executionState = STALE`. What does STALE mean and what do you do?
+**Q5 (Conceptual)** — You run `COPY INTO` on a stage that has 10 files, all already loaded previously. What happens? Why?
 
-**Q6 (Scenario)** — Your Snowpipe loaded 10,000 files successfully over the past month. This morning, 50 files arrived but were not loaded — the pipe shows `PAUSED`. What are the two most likely causes and how do you recover?
+**Q6 (Tricky)** — A developer uses `FORCE = TRUE` in a `COPY INTO` command. What is the risk? When is it acceptable?
 
-**Q7 (Scenario)** — You need to load JSON files (not CSV) from an ADLS container into a VARIANT column using Snowpipe. Walk through the key differences in your Pipe definition compared to loading CSV.
+**Q7 (Scenario)** — You need to load only specific columns from a CSV file and add a `loaded_at` timestamp column. `COPY INTO` runs directly against a stage — it cannot join or filter. How do you do it?
 
-**Q8 (Tricky)** — What is the difference between the `STORAGE INTEGRATION` and the `NOTIFICATION INTEGRATION` required for ADLS auto-ingest? Why are two separate integrations needed?
+**Q8 (Warm-up)** — What is Snowpipe? How is it different from running `COPY INTO` on a 1-minute scheduled Task?
 
-**Q9 (Warm-up)** — What is zero-copy cloning? What does "zero-copy" mean technically — is there no data at all when you first clone?
+**Q9 (Conceptual)** — Snowpipe is described as "serverless." What does that mean for compute and billing compared to a Task that runs COPY INTO?
 
-**Q10 (Conceptual)** — You clone a 10 TB production database to create a dev environment. A developer then runs `DELETE FROM orders WHERE order_date < '2023-01-01'` in the clone. How much additional storage is consumed, and where does it come from?
+**Q10 (Tricky)** — You set up a Pipe with `AUTO_INGEST = FALSE` and run `ALTER PIPE ... REFRESH` to trigger loading. The same file is in the stage but Snowpipe does not load it again. Why?
 
-**Q11 (Tricky)** — Can you clone a table that has an active Stream on it? What happens to the stream in the clone?
+**Q11 (Scenario)** — Your Snowpipe loaded files for 2 weeks. This morning it shows `PIPE_EXECUTION_PAUSED = TRUE` and 20 files in the stage were not loaded. How do you recover without losing those 20 files?
 
-**Q12 (Scenario)** — A developer accidentally deleted 2 million rows from the STAGING table at 3 AM. You need to recover the data. The table has a 1-day Time Travel window. Write the exact SQL to restore the rows using cloning.
+**Q12 (Warm-up)** — What is zero-copy cloning in Snowflake? What does "zero-copy" mean technically?
 
-**Q13 (Conceptual)** — What is Snowflake Data Sharing? How does the consumer access shared data — do they need to copy it into their account first?
+**Q13 (Conceptual)** — You clone a 5 TB production table. A developer then deletes 1 million rows from the clone. How much new storage is created, and where?
 
-**Q14 (Tricky)** — You share a table directly with a partner. The table contains customer PII (email, phone). The partner complains they can see the PII. What is the correct Snowflake pattern to share aggregated data while hiding raw PII? Write the SQL.
+**Q14 (Tricky)** — Can you clone a table that has a Stream on it? What happens to the stream in the clone?
 
-**Q15 (System design)** — Design a real-time order analytics system: orders arrive as JSON files in an ADLS container every few seconds from multiple microservices. The BI team in a partner company needs to query a live daily summary. No data should be shared raw. Walk through the full architecture — storage, ingestion, pipeline, and sharing.
+**Q15 (Scenario)** — At 2 AM a developer ran `DELETE FROM STG_ORDERS WHERE order_date < '2024-01-01'` and deleted 3 million rows by mistake. The table has a 1-day Time Travel window. Write the exact SQL to recover the deleted rows using cloning.
