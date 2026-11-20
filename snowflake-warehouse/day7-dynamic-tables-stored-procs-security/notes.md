@@ -162,14 +162,33 @@ Materialized:  query → reads pre-computed snapshot → instant, no compute at 
 
 ### Materialized View vs Dynamic Table
 
-| | Materialized View | Dynamic Table |
+Both store pre-computed results and auto-refresh. The difference is in **purpose, SQL flexibility, and control**.
+
+| Feature | Materialized View | Dynamic Table |
 |---|---|---|
-| SQL allowed | Simple SELECT, filters, joins, aggregates — no subqueries | Any SELECT including subqueries, CTEs, complex joins |
-| Refresh | Automatic, background, incremental | Automatic, based on target lag |
-| Incremental updates | Yes — only changed rows recomputed | Yes |
-| Use | Accelerate read-heavy queries on a fixed pattern | Build full derived pipeline layers |
-| Cost | Serverless background compute | Serverless background compute |
-| Requires Enterprise | Yes (Enterprise edition or higher) | No (all editions) |
+| **Purpose** | Speed up a specific read-heavy query | Build a full pipeline layer (RAW → STG → MART) |
+| **SQL allowed** | Simple SELECT — no subqueries, limited joins, no UNION | Any SELECT — subqueries, CTEs, UNION, complex joins |
+| **Refresh trigger** | Automatically in background (Snowflake decides when) | Based on `TARGET_LAG` you set (e.g., `'1 minute'`) |
+| **Manual refresh** | Not supported | `ALTER DYNAMIC TABLE ... REFRESH` |
+| **Incremental updates** | Yes — only changed rows recomputed | Yes |
+| **Chaining** | Cannot read from another MV | Can read from another Dynamic Table (DAG-style) |
+| **Suspend / Resume** | Not supported | `ALTER DYNAMIC TABLE ... SUSPEND/RESUME` |
+| **Control over lag** | No — Snowflake manages refresh timing | Yes — you set `TARGET_LAG` explicitly |
+| **Snowflake edition** | Enterprise or higher | All editions (Standard and above) |
+| **Cost** | Serverless background compute | Serverless background compute |
+
+**Simple rule:**
+- Use a **Materialized View** when you have one specific expensive query that runs frequently on a large table, and that query is simple enough to fit MV's restrictions.
+- Use a **Dynamic Table** when you are building a transformation pipeline, need flexible SQL, need to chain transformations, or want explicit control over refresh lag.
+
+```
+Example: order status summary query runs 1000 times/day
+  → MV: pre-computes once, all 1000 reads are instant ✔
+
+Example: RAW → STAGING → MART pipeline
+  → Dynamic Tables: chain them, Snowflake propagates changes end-to-end ✔
+  → MV would not work here — cannot chain MVs, SQL is too restricted ✗
+```
 
 ### Hands-On: Materialized View
 

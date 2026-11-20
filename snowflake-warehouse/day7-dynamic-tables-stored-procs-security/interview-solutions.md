@@ -71,17 +71,20 @@ Use an MV when: the same expensive query runs frequently and the source data cha
 
 **Q5 — Materialized View vs Dynamic Table. When to choose each?**
 
-| | Materialized View | Dynamic Table |
+| Feature | Materialized View | Dynamic Table |
 |---|---|---|
-| SQL complexity | Simple SELECT only — no subqueries, limited joins | Any SELECT — subqueries, CTEs, complex joins |
-| Primary goal | Speed up a specific read-heavy query | Build a full pipeline layer |
-| Incremental refresh | Yes | Yes |
-| Chaining | No — cannot read from another MV | Yes — DT can read from another DT |
-| Edition required | Enterprise | All editions |
+| **Purpose** | Speed up a specific read-heavy query | Build a full pipeline layer (RAW → STG → MART) |
+| **SQL allowed** | Simple SELECT — no subqueries, limited joins, no UNION | Any SELECT — subqueries, CTEs, UNION, complex joins |
+| **Refresh trigger** | Automatic, Snowflake decides timing | Based on `TARGET_LAG` you set (e.g., `'1 minute'`) |
+| **Manual refresh** | Not supported | `ALTER DYNAMIC TABLE ... REFRESH` |
+| **Chaining** | Cannot read from another MV | Can read from another DT (DAG-style pipeline) |
+| **Suspend / Resume** | Not supported | `ALTER DYNAMIC TABLE ... SUSPEND/RESUME` |
+| **Control over lag** | No | Yes — you set `TARGET_LAG` explicitly |
+| **Edition required** | Enterprise | All editions |
 
-**Choose Materialized View** when: you have one specific, frequently-run query on a large table that you want to accelerate, and that query is simple enough to fit MV's restrictions.
+**Choose Materialized View** when: you have one specific, frequently-run query on a large table that you want to accelerate, and that query is simple enough to fit MV's SQL restrictions.
 
-**Choose Dynamic Table** when: you are building a pipeline layer (RAW → STAGING → MART), the SQL is complex, or you need to chain transformations.
+**Choose Dynamic Table** when: you are building a transformation pipeline (RAW → STAGING → MART), the SQL is complex (subqueries, CTEs, UNION), you need to chain transformations, or you want explicit control over how stale the data can be.
 
 ---
 
