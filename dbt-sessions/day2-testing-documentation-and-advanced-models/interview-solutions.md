@@ -322,3 +322,61 @@ WHEN NOT MATCHED THEN
 **Result:** The existing row for that `order_id` is **updated in place** — `status` changes from `CONFIRMED` to `SHIPPED`. No duplicate row is created.
 
 Without `unique_key`, dbt would do a plain INSERT — the old row (CONFIRMED) stays and a new row (SHIPPED) is added, giving you two rows for the same order. `unique_key` prevents this.
+
+---
+
+**Q16 — Both folders land in `ECOMM_DB.STAGING`. How do you route each folder to its own schema?**
+
+Two changes are needed together — neither works alone.
+
+**Step 1 — Add `+schema` per folder in `dbt_project.yml`:**
+
+```yaml
+models:
+  ecomm_dbt:
+    staging:
+      +materialized: view
+      +schema: STAGING
+    marts:
+      +materialized: table
+      +schema: MARTS
+```
+
+**Step 2 — Override `generate_schema_name` in `macros/generate_schema_name.sql`:**
+
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- if custom_schema_name is none -%}
+        {{ target.schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+**Result:**
+
+```
+models/staging/stg_orders.sql  → ECOMM_DB.STAGING.STG_ORDERS   ✔
+models/marts/orders_mart.sql   → ECOMM_DB.MARTS.ORDERS_MART     ✔
+```
+
+The `profiles.yml` schema is now just a fallback for any folder without `+schema` set. You never need to edit it to change where models land — just update `dbt_project.yml`.
+
+---
+
+**Q17 — `+schema: MARTS` added in `dbt_project.yml` but no macro override. Where does `orders_mart` land?**
+
+It lands in `ECOMM_DB.STAGING_MARTS` — not `ECOMM_DB.MARTS`.
+
+dbt's default `generate_schema_name` logic **concatenates** the `profiles.yml` schema and the custom schema with an underscore:
+
+```
+target.schema + "_" + custom_schema_name
+= "STAGING" + "_" + "MARTS"
+= "STAGING_MARTS"
+```
+
+This is dbt's intentional default to avoid schema collisions across different developers or environments — if two people set `+schema: MARTS` with different `profiles.yml` schemas, they still get separate schemas (`dev_MARTS`, `prod_MARTS`).
+
+The macro override replaces this concatenation logic so that `custom_schema_name` is used as-is. Without the override, `+schema` alone does not give you the exact schema name you specified.

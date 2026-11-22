@@ -41,3 +41,7 @@ Include the full Jinja block with `is_incremental()` and explain each line.
 **Q14 (Scenario)** — A new analyst joins the team and asks: "How do I know what `total_amount` means — is it pre-tax, post-tax, in USD or EUR?" What dbt feature answers this question without bothering the data engineer, and where do they find it?
 
 **Q15 (Tricky)** — You set `materialized='incremental'` with `unique_key='order_id'`. An existing order changes its `status` from `CONFIRMED` to `SHIPPED` in the source. On the next `dbt run`, what happens to this row in your incremental table? What SQL does dbt generate?
+
+**Q16 (Scenario)** — Your `profiles.yml` has `schema: STAGING`. You have two model folders: `models/staging/` and `models/marts/`. After `dbt run`, both `stg_orders` and `orders_mart` land in `ECOMM_DB.STAGING`. How do you make each folder write to its own schema (`STAGING` for staging, `MARTS` for marts) without hardcoding schema names in every model file?
+
+**Q17 (Tricky)** — You add `+schema: MARTS` in `dbt_project.yml` for the marts folder but do NOT create the `generate_schema_name` macro. You run `dbt run`. Where does `orders_mart` actually land, and why?

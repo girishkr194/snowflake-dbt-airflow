@@ -2,16 +2,134 @@
 
 ## What You Will Learn
 
-1. **Sources with freshness** — Properly declare raw tables, check if source data is stale
-2. **Schema YAML** — Describe every column, attach tests in a `.yml` file
-3. **Built-in tests** — `not_null`, `unique`, `accepted_values`, `relationships`
-4. **`dbt test`** — Run all tests, understand pass/fail output
-5. **Incremental models** — Only process new rows instead of rebuilding the full table
-6. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
-7. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
+1. **Dynamic schema routing** — Write staging models to `STAGING`, mart models to `MARTS` — automatically, without changing `profiles.yml`
+2. **Sources with freshness** — Properly declare raw tables, check if source data is stale
+3. **Schema YAML** — Describe every column, attach tests in a `.yml` file
+4. **Built-in tests** — `not_null`, `unique`, `accepted_values`, `relationships`
+5. **`dbt test`** — Run all tests, understand pass/fail output
+6. **Incremental models** — Only process new rows instead of rebuilding the full table
+7. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
+8. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
 
 > **Starting point:** The `ecomm_dbt` project from Day 1 with `stg_orders.sql` running.
-> Today we improve it: add sources, descriptions, tests, and an incremental model.
+> Today we improve it: add dynamic schema routing, sources, descriptions, tests, and an incremental model.
+
+---
+
+## Concept 0 — Dynamic Schema Routing
+
+### The Problem
+
+`profiles.yml` has a single `schema:` field. Whatever you put there is where **all** models land — regardless of which folder they are in.
+
+```
+profiles.yml → schema: STAGING
+
+Result:
+  models/staging/stg_orders.sql   → ECOMM_DB.STAGING.STG_ORDERS    ✔
+  models/marts/orders_mart.sql    → ECOMM_DB.STAGING.ORDERS_MART    ✘  (should go to MARTS)
+```
+
+If you change `schema: MARTS` in `profiles.yml`, the mart goes to the right place but staging breaks. You cannot fix this by editing `profiles.yml` — it only holds one schema value.
+
+### The Solution: `+schema` in dbt_project.yml + a custom macro
+
+dbt has a built-in hook called `generate_schema_name`. By default it takes the schema from `profiles.yml` and **appends** your folder-level schema to it, producing names like `STAGING_MARTS` — not what you want.
+
+The fix is two steps:
+
+**Step 1 — tell each folder which schema to use in `dbt_project.yml`:**
+
+```yaml
+models:
+  ecomm_dbt:
+    staging:
+      +materialized: view
+      +schema: STAGING
+    marts:
+      +materialized: table
+      +schema: MARTS
+```
+
+**Step 2 — override `generate_schema_name` to use the folder schema as-is:**
+
+Create `macros/generate_schema_name.sql`:
+
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- if custom_schema_name is none -%}
+        {{ target.schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+**How it works:**
+
+Without the macro, dbt's default logic produces: `{target.schema}_{custom_schema_name}` → `STAGING_MARTS`.
+
+With the macro override:
+- If `+schema` is set in `dbt_project.yml` → use it exactly as written (`STAGING`, `MARTS`)
+- If `+schema` is not set → fall back to whatever is in `profiles.yml`
+
+**Result after both changes:**
+
+```
+profiles.yml → schema: STAGING  (this is now just a fallback, rarely matters)
+
+models/staging/stg_orders.sql   → ECOMM_DB.STAGING.STG_ORDERS   ✔
+models/marts/orders_mart.sql    → ECOMM_DB.MARTS.ORDERS_MART     ✔
+```
+
+You never need to touch `profiles.yml` again when adding new model folders. Just add `+schema: <your_schema>` in `dbt_project.yml`.
+
+### What each part does
+
+`+schema: STAGING` in `dbt_project.yml` — the `+` prefix means "apply to all models in this folder". Sets the `custom_schema_name` variable that dbt passes to `generate_schema_name`.
+
+`custom_schema_name is none` — if a model folder has no `+schema` set, `custom_schema_name` is None. We fall back to `target.schema` (the value from `profiles.yml`).
+
+`{{ custom_schema_name | trim }}` — `trim` removes any accidental leading/trailing whitespace from the schema name before using it.
+
+`target.schema` — the schema value from `profiles.yml` for the current target (`dev`, `prod`, etc.).
+
+### Full working dbt_project.yml after this change
+
+```yaml
+name: 'ecomm_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'ecomm_dbt'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+models:
+  ecomm_dbt:
+    staging:
+      +materialized: view
+      +schema: STAGING
+    marts:
+      +materialized: table
+      +schema: MARTS
+```
+
+### Verify it works
+
+```bash
+dbt run
+```
+
+```sql
+SHOW VIEWS  IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
+```
+
+`STG_ORDERS` should appear under `STAGING`, `ORDERS_MART` under `MARTS`.
 
 ---
 

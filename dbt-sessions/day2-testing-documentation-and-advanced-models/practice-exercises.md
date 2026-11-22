@@ -17,6 +17,89 @@ Expected: `PASS=2 (stg_orders, orders_mart)  ERROR=0  SKIP=0`
 
 ---
 
+## Exercise 0 — Fix Dynamic Schema Routing
+
+### The Problem
+
+`profiles.yml` has only one `schema:` field. If you set `schema: STAGING`, every model — staging and marts — lands in `ECOMM_DB.STAGING`. If you change it to `MARTS`, staging breaks. You need each folder to write to its own schema automatically.
+
+### Step 1: Check where models are landing right now
+
+```sql
+SHOW VIEWS  IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
+```
+
+Notice that `ORDERS_MART` may be in `STAGING` instead of `MARTS` depending on what your `profiles.yml` currently has. This is the problem we are fixing.
+
+### Step 2: Add `+schema` per folder in `dbt_project.yml`
+
+Open `dbt_project.yml` and update the `models:` section:
+
+```yaml
+models:
+  ecomm_dbt:
+    staging:
+      +materialized: view
+      +schema: STAGING
+    marts:
+      +materialized: table
+      +schema: MARTS
+```
+
+`+schema: STAGING` tells dbt: every model inside `models/staging/` should go into the `STAGING` schema.
+`+schema: MARTS` tells dbt: every model inside `models/marts/` should go into the `MARTS` schema.
+
+If you run `dbt run` right now, models will land in schemas like `STAGING_STAGING` and `STAGING_MARTS` — dbt's default behaviour prepends the `profiles.yml` schema to the folder schema. We fix that in the next step.
+
+### Step 3: Override `generate_schema_name` macro
+
+Create the file `macros/generate_schema_name.sql`:
+
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- if custom_schema_name is none -%}
+        {{ target.schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+This macro tells dbt:
+- If a folder has `+schema` set → use that value exactly as written (e.g. `STAGING`, `MARTS`)
+- If no `+schema` is set → fall back to the schema from `profiles.yml`
+
+Without this macro override, dbt's default logic produces `STAGING_MARTS` (concatenating both). With it, dbt uses the folder schema as-is.
+
+### Step 4: Run and verify
+
+```bash
+dbt run
+```
+
+```sql
+SHOW VIEWS  IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
+```
+
+Expected:
+- `ECOMM_DB.STAGING.STG_ORDERS` → view
+- `ECOMM_DB.MARTS.ORDERS_MART` → table
+
+Each model folder now writes to its own dedicated Snowflake schema automatically. You never need to edit `profiles.yml` to switch schemas — just add `+schema:` to a folder in `dbt_project.yml`.
+
+### Step 5: Check the compiled SQL to confirm
+
+```bash
+type target\compiled\ecomm_dbt\models\marts\orders_mart.sql
+```
+
+The FROM clause should reference `ECOMM_DB.STAGING.STG_ORDERS` (not `ECOMM_DB.STAGING_STAGING.STG_ORDERS`), confirming the macro is working correctly.
+
+---
+
 ## Exercise 1 — Add a Source Declaration
 
 Right now `stg_orders.sql` hardcodes `FROM ECOMM_DB.RAW_DATA.ORDERS_RAW`.
