@@ -1,7 +1,7 @@
 # Day 2 — Practice Exercises: Testing, Documentation, and Advanced Models
 
 > All exercises build on the `ecomm_dbt` project from Day 1.
-> ORDERS_RAW must exist in Snowflake with at least 10 rows.
+> `ECOMM_DB.RAW_DATA.ORDERS_RAW` must exist with at least 10 rows.
 > Run all dbt commands from inside the `ecomm_dbt/` project directory.
 > Estimated total time: 60–75 minutes.
 
@@ -10,10 +10,10 @@
 ## Pre-Check
 
 ```bash
-# Confirm your Day 1 project still runs clean
 dbt run
-# Expected: PASS=2 (stg_orders, orders_mart)  ERROR=0  SKIP=0
 ```
+
+Expected: `PASS=2 (stg_orders, orders_mart)  ERROR=0  SKIP=0`
 
 ---
 
@@ -25,41 +25,37 @@ We will fix that by declaring a source and using `{{ source() }}`.
 ### Step 1: Create `models/staging/sources.yml`
 
 ```yaml
-version: 2                        # always required — tells dbt this is a v2 config file
+version: 2
 
 sources:
-  - name: raw_data                # logical name — used in {{ source('raw_data', ...) }}
-    database: ECOMM_DB            # Snowflake database that contains the raw table
-    schema: RAW_DATA              # Snowflake schema that contains the raw table
-    description: >
-      Raw tables loaded from source systems via Snowpipe or COPY INTO.
-      Do not modify these tables directly.
-
-    loaded_at_field: updated_at   # column dbt uses to check source freshness
-                                  # dbt runs: SELECT MAX(updated_at) FROM orders_raw
-                                  # and compares it to CURRENT_TIMESTAMP()
-
-    freshness:                    # define what "stale" means for this source
-      warn_after:                 # issue a WARNING if data is older than this
+  - name: raw_data
+    database: ECOMM_DB
+    schema: RAW_DATA
+    description: "Raw tables loaded from source systems via Snowpipe or COPY INTO."
+    loaded_at_field: updated_at
+    freshness:
+      warn_after:
         count: 24
         period: hour
-      error_after:                # issue an ERROR if data is older than this
+      error_after:
         count: 48
         period: hour
-
     tables:
-      - name: orders_raw          # actual Snowflake table name
-        description: >
-          One row per customer order. Contains all statuses including CANCELLED.
+      - name: orders_raw
+        description: "One row per customer order. Contains all statuses including CANCELLED."
 ```
+
+**What each field does:**
+- `name: raw_data` — the logical name used in `{{ source('raw_data', ...) }}`. Does not have to match the Snowflake schema name.
+- `database: ECOMM_DB` — the Snowflake database
+- `schema: RAW_DATA` — the Snowflake schema
+- `loaded_at_field: updated_at` — the column dbt checks for freshness. dbt runs `SELECT MAX(updated_at)` and compares to current time.
+- `warn_after` / `error_after` — how stale is too stale (24h = warning, 48h = error)
+- `tables: - name: orders_raw` — the actual Snowflake table name
 
 ### Step 2: Update `models/staging/stg_orders.sql`
 
-Replace the hardcoded `FROM` with `{{ source() }}`:
-
 ```sql
--- models/staging/stg_orders.sql
-
 SELECT
     order_id,
     customer_id,
@@ -72,26 +68,35 @@ SELECT
     order_date,
     updated_at
 FROM {{ source('raw_data', 'orders_raw') }}
--- {{ source('raw_data', 'orders_raw') }} resolves to ECOMM_DB.RAW_DATA.ORDERS_RAW
--- 'raw_data' must match the `name:` key in sources.yml
--- 'orders_raw' must match the `name:` key under tables: in sources.yml
 WHERE order_id IS NOT NULL
 ```
+
+`{{ source('raw_data', 'orders_raw') }}` resolves to `ECOMM_DB.RAW_DATA.ORDERS_RAW` at run time.
+- `'raw_data'` matches the `name:` key under `sources:` in your YAML
+- `'orders_raw'` matches the `name:` key under `tables:` in your YAML
 
 ### Step 3: Run the model and verify
 
 ```bash
 dbt run --select stg_orders
-# Expected: OK  created sql view model DBT_DEV.stg_orders
+```
+
+Expected: `OK  created sql view model STAGING.stg_orders`
+
+Verify in Snowsight:
+```sql
+SELECT * FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
 ```
 
 ### Step 4: Check source freshness
 
 ```bash
 dbt source freshness
-# Expected: PASS freshness of raw_data.orders_raw
-# If WARN or ERROR: your ORDERS_RAW data hasn't been updated recently
 ```
+
+Expected: `PASS  freshness of raw_data.orders_raw`
+
+If you see WARN or ERROR, it means `ORDERS_RAW.updated_at` has not been updated within the threshold.
 
 ---
 
@@ -103,17 +108,16 @@ dbt source freshness
 version: 2
 
 models:
-  - name: stg_orders              # must exactly match the filename stg_orders.sql (no .sql)
+  - name: stg_orders
     description: >
       Cleaned orders from ORDERS_RAW. Single source of truth for all order data.
-      WHERE order_id IS NOT NULL filters out any corrupt rows from the source.
 
     columns:
       - name: order_id
-        description: "Primary key — unique integer identifier for each order. Never NULL."
+        description: "Primary key — unique integer identifier for each order"
         tests:
-          - not_null              # dbt checks: SELECT COUNT(*) WHERE order_id IS NULL → must be 0
-          - unique                # dbt checks: no duplicate order_id values → must be 0 duplicates
+          - not_null
+          - unique
 
       - name: customer_id
         description: "Foreign key — integer ID of the customer who placed this order"
@@ -149,8 +153,8 @@ models:
         description: "Current fulfillment status of the order"
         tests:
           - not_null
-          - accepted_values:      # checks that every status value is in this list
-              values:             # dbt fails if any row has a status NOT in this list
+          - accepted_values:
+              values:
                 - 'CONFIRMED'
                 - 'SHIPPED'
                 - 'DELIVERED'
@@ -167,55 +171,53 @@ models:
           - not_null
 ```
 
+**What each field does:**
+- `name: stg_orders` — must exactly match the filename `stg_orders.sql` (without `.sql`)
+- `tests: - not_null` — dbt generates `SELECT COUNT(*) WHERE column IS NULL`. Fails if count > 0.
+- `tests: - unique` — dbt generates a GROUP BY query. Fails if any value appears more than once.
+- `accepted_values: values:` — dbt checks every row's status is in this list. Fails if any other value is found.
+
 ### Step 2: Run the tests
 
 ```bash
 dbt test --select stg_orders
-# Expected: PASS=9 — one test per column (not_null for each + unique + accepted_values)
 ```
 
-### Step 3: Read the output carefully
+Expected: `PASS=9  WARN=0  ERROR=0  SKIP=0`
 
-For each passing test you should see:
-```
-PASS test not_null_stg_orders_order_id
-PASS test unique_stg_orders_order_id
-PASS test not_null_stg_orders_customer_id
-...
-PASS test accepted_values_stg_orders_status__CONFIRMED__SHIPPED__DELIVERED__CANCELLED
-```
+Each test is named: `{test_type}_{model_name}_{column_name}`.
+Example: `not_null_stg_orders_order_id`, `unique_stg_orders_order_id`
 
-### Step 4: Deliberately break a test to see failure
+### Step 3: Deliberately break a test to see failure
 
 Insert a bad row in Snowsight:
+
 ```sql
--- Run in Snowsight
 INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
     (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date)
 VALUES (9999, 99, 'Test User', 'Widget', 1, 10.00, 10.00, 'PENDING', '2024-06-01');
--- 'PENDING' is NOT in our accepted_values list
 ```
 
-Re-run the model and test:
+`'PENDING'` is not in our `accepted_values` list.
+
+Re-run:
 ```bash
 dbt run --select stg_orders
 dbt test --select stg_orders
-# Expected: FAIL 1  test accepted_values_stg_orders_status__...
-#           The number 1 = one row with an unexpected status value
 ```
 
-Find the failing row:
+Expected: `FAIL 1  test accepted_values_stg_orders_status__...`
+
+The `1` = one row violated the test. Find it:
+
 ```sql
--- Run in Snowsight to see which rows failed
 SELECT *
-FROM ECOMM_DB.DBT_DEV.STG_ORDERS
+FROM ECOMM_DB.STAGING.STG_ORDERS
 WHERE status NOT IN ('CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED');
--- Should return order_id = 9999
 ```
 
 Clean up:
 ```sql
--- Remove the bad row from the source
 DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW WHERE order_id = 9999;
 ```
 
@@ -223,27 +225,33 @@ Re-run:
 ```bash
 dbt run --select stg_orders
 dbt test --select stg_orders
-# Expected: PASS=9 again
 ```
+
+Expected: `PASS=9` again.
 
 ---
 
 ## Exercise 3 — Build + Test Together with `dbt build`
 
 ```bash
-# dbt build = dbt run + dbt test per model, in dependency order
-# stg_orders runs → stg_orders tests pass → orders_mart runs → orders_mart tests (none yet)
 dbt build
-
-# Expected:
-# 1 of 2 START sql view model DBT_DEV.stg_orders .................. OK
-# 2 of 9 START test not_null_stg_orders_order_id .................. PASS
-# ...
-# 10 of 10 START sql table model DBT_DEV.orders_mart .............. OK
-# Done. PASS=10 WARN=0 ERROR=0 SKIP=0 TOTAL=10
 ```
 
-Now add tests to the mart model. Create `models/marts/schema.yml`:
+`dbt build` runs `dbt run` + `dbt test` per model in dependency order:
+`stg_orders` runs → `stg_orders` tests pass → `orders_mart` runs → `orders_mart` tests run
+
+If `stg_orders` tests fail, `orders_mart` is skipped — dbt prevents bad data from flowing downstream.
+
+Expected output:
+```
+1 of 10 START sql view model STAGING.stg_orders ................. OK
+2 of 10 START test not_null_stg_orders_order_id ................. PASS
+...
+10 of 10 START sql table model MARTS.orders_mart ................ OK
+Done. PASS=10 WARN=0 ERROR=0 SKIP=0 TOTAL=10
+```
+
+Now add tests to the mart. Create `models/marts/schema.yml`:
 
 ```yaml
 version: 2
@@ -252,14 +260,14 @@ models:
   - name: orders_mart
     description: >
       Daily order summary. One row per order_date.
-      Rebuilt as a full table on every dbt run from stg_orders.
+      Rebuilt as a full table on every dbt run.
 
     columns:
       - name: order_date
         description: "Calendar date — each date appears exactly once in this table"
         tests:
           - not_null
-          - unique               # the mart aggregates by order_date so each date = 1 row
+          - unique
 
       - name: total_orders
         description: "Count of all orders placed on this date, all statuses included"
@@ -275,8 +283,9 @@ models:
 Run build again:
 ```bash
 dbt build
-# Now runs tests for both stg_orders and orders_mart
 ```
+
+Now includes tests for both `stg_orders` and `orders_mart`.
 
 ---
 
@@ -285,16 +294,12 @@ dbt build
 ### Step 1: Create `models/staging/stg_orders_incremental.sql`
 
 ```sql
--- models/staging/stg_orders_incremental.sql
-
-{{                                    -- open Jinja block
+{{
     config(
-        materialized = 'incremental', -- first run: CREATE TABLE AS SELECT (all rows)
-                                      -- subsequent runs: INSERT/MERGE only new rows
-        unique_key   = 'order_id'     -- if order_id already exists in the target table,
-                                      -- UPDATE that row instead of inserting a duplicate
+        materialized = 'incremental',
+        unique_key   = 'order_id'
     )
-}}                                    -- close Jinja block
+}}
 
 SELECT
     order_id,
@@ -310,38 +315,38 @@ SELECT
 FROM {{ source('raw_data', 'orders_raw') }}
 
 {% if is_incremental() %}
--- This block is only included AFTER the first run.
--- is_incremental() returns TRUE when the target table already exists.
--- On the first run, is_incremental() = FALSE → no WHERE clause → all rows loaded.
---
--- On subsequent runs:
---   {{ this }} = the incremental table we are updating (stg_orders_incremental)
---   We find the most recent updated_at already loaded, then filter to rows newer than that.
 WHERE updated_at > (
-    SELECT MAX(updated_at)   -- find the latest timestamp already in the incremental table
-    FROM {{ this }}           -- {{ this }} = ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL
+    SELECT MAX(updated_at)
+    FROM {{ this }}
 )
 {% endif %}
 ```
+
+**Line-by-line explanation:**
+- `materialized = 'incremental'` — first run builds the full table; subsequent runs only process new rows
+- `unique_key = 'order_id'` — if `order_id` already exists, dbt MERGEs (updates) it instead of inserting a duplicate
+- `{% if is_incremental() %}` — TRUE after the first build, FALSE on first run. The WHERE clause is only included on subsequent runs.
+- `{{ this }}` — refers to the incremental table itself (`ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL`). Used to find the latest `updated_at` already loaded.
+- `{% endif %}` — closes the Jinja if block
 
 ### Step 2: First run — builds the full table
 
 ```bash
 dbt run --select stg_orders_incremental
-# is_incremental() = FALSE — all rows from ORDERS_RAW are loaded
-# dbt creates: ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL as a TABLE
 ```
+
+`is_incremental()` = FALSE — all rows from ORDERS_RAW are loaded. dbt creates `ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL` as a table.
 
 Verify:
 ```sql
-SELECT COUNT(*) FROM ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL;
--- Should match ORDERS_RAW count
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL;
 ```
 
-### Step 3: Insert a new order into ORDERS_RAW
+Should match the row count in `ECOMM_DB.RAW_DATA.ORDERS_RAW`.
+
+### Step 3: Insert a new order
 
 ```sql
--- Run in Snowsight
 INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
     (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date)
 VALUES (6001, 61, 'Sam Rivera', 'Wireless Charger', 2, 29.99, 59.98, 'CONFIRMED', '2024-05-01');
@@ -351,23 +356,22 @@ VALUES (6001, 61, 'Sam Rivera', 'Wireless Charger', 2, 29.99, 59.98, 'CONFIRMED'
 
 ```bash
 dbt run --select stg_orders_incremental
-# is_incremental() = TRUE — only rows with updated_at newer than MAX(updated_at) are processed
-# dbt MERGEs on order_id — the new row (6001) is inserted
 ```
+
+`is_incremental()` = TRUE — dbt applies the WHERE filter, picks up order 6001, and INSERTs it.
 
 Verify:
 ```sql
--- New row should appear
-SELECT * FROM ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL WHERE order_id = 6001;
+SELECT * FROM ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL WHERE order_id = 6001;
 
--- Count should be original + 1
-SELECT COUNT(*) FROM ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL;
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL;
 ```
 
-### Step 5: Update an existing order status
+Count should be original + 1.
+
+### Step 5: Update an existing order
 
 ```sql
--- Run in Snowsight — change order 6001 from CONFIRMED to SHIPPED
 UPDATE ECOMM_DB.RAW_DATA.ORDERS_RAW
 SET status = 'SHIPPED', updated_at = CURRENT_TIMESTAMP()
 WHERE order_id = 6001;
@@ -376,31 +380,26 @@ WHERE order_id = 6001;
 Run again:
 ```bash
 dbt run --select stg_orders_incremental
-# The WHERE filter picks up the updated row (updated_at just changed)
-# Because unique_key='order_id', dbt MERGEs: existing row is UPDATED, not duplicated
 ```
+
+The WHERE filter picks up order 6001 (its `updated_at` just changed). Because `unique_key='order_id'`, dbt MERGEs: the existing row is updated in place — no duplicate.
 
 Verify:
 ```sql
--- Status should now be SHIPPED, not CONFIRMED
 SELECT order_id, status, updated_at
-FROM ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL
+FROM ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL
 WHERE order_id = 6001;
-
--- Still same total count — no duplicate row was inserted
-SELECT COUNT(*) FROM ECOMM_DB.DBT_DEV.STG_ORDERS_INCREMENTAL;
 ```
+
+Status should now be `SHIPPED`. Count should be unchanged.
 
 ### Step 6: Force a full refresh
 
 ```bash
-# Use --full-refresh to drop and rebuild the entire incremental table from scratch
-# Use this when: bug in historical logic, schema change, or data corruption
 dbt run --select stg_orders_incremental --full-refresh
-
-# is_incremental() = FALSE even though the table exists
-# dbt drops the table, rebuilds it completely
 ```
+
+Drops and rebuilds the entire table from scratch. Use this when you fix a bug in historical transformation logic.
 
 ---
 
@@ -410,36 +409,37 @@ dbt run --select stg_orders_incremental --full-refresh
 
 ```bash
 dbt docs generate
-# Reads all schema.yml files + queries Snowflake for column metadata
-# Writes output to target/catalog.json and target/manifest.json
 ```
+
+Reads all `schema.yml` files and queries Snowflake for column metadata. Output: `target/catalog.json`.
 
 ### Step 2: Serve the docs
 
 ```bash
 dbt docs serve
-# Opens browser at http://localhost:8080
 ```
+
+Opens `http://localhost:8080`.
 
 ### Step 3: Explore the docs UI
 
 Navigate through these pages:
 
-1. **Project tab (left panel)** — expand `models/staging/` and `models/marts/`
-   - Click `stg_orders` — see the description and column list with descriptions
+1. **Project tab** — expand `models/staging/` and `models/marts/`
+   Click `stg_orders` — see the model description and column list
 
-2. **Column tests** — click `order_id` column in `stg_orders`
-   - Should show: Tests: `not_null`, `unique`
+2. **Column tests** — click the `order_id` column
+   Should show tests: `not_null`, `unique`
 
 3. **Sources tab** — click `raw_data` → `orders_raw`
-   - Should show the source description and freshness config
+   See the source description and freshness config
 
 4. **Lineage graph** — click the graph icon (bottom right of any model page)
-   - Should show: `[source: orders_raw] → stg_orders → orders_mart`
-   - `stg_orders_incremental` should also appear as a consumer of `orders_raw`
+   Should show: `[source: orders_raw] → stg_orders → orders_mart`
+   `stg_orders_incremental` should also appear connected to `orders_raw`
 
-5. **Search** — type `total_amount` in the search bar
-   - Both `stg_orders` and `orders_mart` columns should appear
+5. **Search** — type `total_amount`
+   Both `stg_orders` and `orders_mart` columns should appear
 
 Stop the server with `Ctrl+C`.
 
@@ -448,24 +448,22 @@ Stop the server with `Ctrl+C`.
 ## Final Verification
 
 ```bash
-# Run everything — all models + all tests
 dbt build
-
-# Expected:
-# PASS = all models + all tests
-# WARN = 0
-# ERROR = 0
-# SKIP = 0
 ```
 
+Expected: `PASS = all models + all tests  WARN=0  ERROR=0  SKIP=0`
+
+Verify objects in Snowsight:
 ```sql
--- Verify all objects exist in Snowsight
-SHOW VIEWS IN SCHEMA ECOMM_DB.DBT_DEV;
--- stg_orders, stg_orders_incremental (wait — incremental is a TABLE not VIEW)
-
-SHOW TABLES IN SCHEMA ECOMM_DB.DBT_DEV;
--- stg_orders_incremental, orders_mart, customer_summary
+SHOW VIEWS  IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
 ```
+
+Expected:
+- `ECOMM_DB.STAGING.STG_ORDERS` → view
+- `ECOMM_DB.STAGING.STG_ORDERS_INCREMENTAL` → table
+- `ECOMM_DB.MARTS.ORDERS_MART` → table
 
 ---
 
@@ -475,6 +473,6 @@ SHOW TABLES IN SCHEMA ECOMM_DB.DBT_DEV;
 |---|---|
 | 1 | `sources.yml` created, `stg_orders.sql` updated to use `{{ source() }}`, freshness check passing |
 | 2 | `schema.yml` with column descriptions and tests, `dbt test` passing, deliberate failure and recovery |
-| 3 | `dbt build` = run + test together in order; mart schema.yml with tests |
-| 4 | Incremental model: first full run, INSERT on new row, MERGE on update, `--full-refresh` |
+| 3 | `dbt build` = run + test in dependency order; mart `schema.yml` with tests |
+| 4 | Incremental model — first full build, INSERT on new row, MERGE on update, `--full-refresh` |
 | 5 | `dbt docs generate` + `dbt docs serve`, lineage graph, source node, column-level descriptions |

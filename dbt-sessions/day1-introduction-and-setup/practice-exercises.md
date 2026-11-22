@@ -1,6 +1,6 @@
 # Day 1 — Practice Exercises: dbt Introduction and Setup
 
-> All exercises build on the Snowflake tables from the Snowflake module (ECOMM_DB.RAW_DATA.ORDERS_RAW).
+> All exercises build on the Snowflake tables from the Snowflake module (`ECOMM_DB.RAW_DATA.ORDERS_RAW`).
 > Run all dbt commands from inside the `ecomm_dbt/` project directory.
 > Estimated total time: 60–75 minutes.
 
@@ -8,13 +8,11 @@
 
 ## Pre-Check
 
-Make sure these exist in Snowflake before starting:
-
 ```sql
--- Run in Snowsight to verify
 SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
--- Should return at least 10 rows (from the Snowflake module)
 ```
+
+Should return at least 10 rows (from the Snowflake module).
 
 ---
 
@@ -24,8 +22,6 @@ SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;
 
 ```bash
 pip install dbt-snowflake
-
-# Verify
 dbt --version
 ```
 
@@ -33,8 +29,6 @@ Expected output:
 ```
 Core:
   - installed: 1.x.x
-  - latest:    1.x.x
-
 Plugins:
   - snowflake: 1.x.x
 ```
@@ -47,15 +41,17 @@ dbt init ecomm_dbt
 
 When prompted:
 - Adapter: `snowflake`
-- Account: your Snowflake account identifier (e.g., `xy12345.us-east-1`)
+- Account: your Snowflake account identifier (e.g. `xy12345.us-east-1`)
 - User: your Snowflake username
 - Authentication: `password`
 - Password: your Snowflake password
 - Role: `SYSADMIN`
 - Warehouse: `COMPUTE_WH`
 - Database: `ECOMM_DB`
-- Schema: `DBT_DEV`
+- Schema: `STAGING`
 - Threads: `4`
+
+The `Schema` prompt sets where dbt writes staging models. Use `STAGING` to match the existing Snowflake schema.
 
 ```bash
 cd ecomm_dbt
@@ -64,25 +60,14 @@ cd ecomm_dbt
 ### Step 3: Inspect the project structure
 
 ```bash
-ls -la
-# or on Windows:
 dir
 ```
 
-Confirm these exist:
-- `dbt_project.yml`
-- `models/`
-- `macros/`
-- `seeds/`
-- `tests/`
+Confirm these exist: `dbt_project.yml`, `models/`, `macros/`, `seeds/`, `tests/`
 
 ### Step 4: Check where profiles.yml was created
 
 ```bash
-# On Mac/Linux:
-cat ~/.dbt/profiles.yml
-
-# On Windows:
 type %USERPROFILE%\.dbt\profiles.yml
 ```
 
@@ -94,7 +79,7 @@ Confirm it has your Snowflake credentials under the `ecomm_dbt` profile key.
 dbt debug
 ```
 
-Every line should show `OK`. If any line shows `ERROR`, fix the credentials in `profiles.yml` and re-run.
+Every check should show `OK`. If any line shows `ERROR`, fix the credentials in `profiles.yml` and re-run.
 
 ---
 
@@ -103,11 +88,6 @@ Every line should show `OK`. If any line shows `ERROR`, fix the credentials in `
 ### Step 1: Clean up the example models
 
 ```bash
-# Delete the generated example folder
-# On Mac/Linux:
-rm -rf models/example
-
-# On Windows:
 rmdir /s /q models\example
 ```
 
@@ -127,6 +107,11 @@ sources:
       - name: orders_raw
         description: "Raw orders — one row per order"
 ```
+
+**What each field does:**
+- `name: raw_data` — logical name used in `{{ source('raw_data', ...) }}`
+- `database / schema` — the Snowflake database and schema where `ORDERS_RAW` lives
+- `tables: - name: orders_raw` — the actual table name in Snowflake
 
 ### Step 3: Create the staging model
 
@@ -148,6 +133,8 @@ FROM {{ source('raw_data', 'orders_raw') }}
 WHERE order_id IS NOT NULL
 ```
 
+`{{ source('raw_data', 'orders_raw') }}` resolves to `ECOMM_DB.RAW_DATA.ORDERS_RAW` at run time.
+
 ### Step 4: Set staging materialization in dbt_project.yml
 
 Open `dbt_project.yml` and update the `models:` section:
@@ -157,7 +144,11 @@ models:
   ecomm_dbt:
     staging:
       +materialized: view
+    marts:
+      +materialized: table
 ```
+
+The `+` means "apply this config to all files in this folder". Staging = view (no data stored), Marts = table (pre-computed).
 
 ### Step 5: Run the staging model
 
@@ -167,21 +158,17 @@ dbt run --select stg_orders
 
 Expected output:
 ```
-1 of 1 START sql view model DBT_DEV.stg_orders .................. [RUN]
-1 of 1 OK created sql view model DBT_DEV.stg_orders ............. [CREATE VIEW in 1.23s]
-
-Finished running 1 view model in 0 hours 0 minutes and 2.xx seconds (0:00:02.xx).
-Completed successfully.
+1 of 1 OK created sql view model STAGING.stg_orders ............. [CREATE VIEW in 1.23s]
 Done. PASS=1 WARN=0 ERROR=0 SKIP=0 TOTAL=1
 ```
 
 ### Step 6: Verify in Snowsight
 
 ```sql
--- Run in Snowsight
-SELECT * FROM ECOMM_DB.DBT_DEV.STG_ORDERS ORDER BY order_id;
--- Should show all rows from ORDERS_RAW
+SELECT * FROM ECOMM_DB.STAGING.STG_ORDERS ORDER BY order_id;
 ```
+
+Should show all rows from ORDERS_RAW.
 
 ---
 
@@ -208,6 +195,9 @@ GROUP BY order_date
 ORDER BY order_date
 ```
 
+`{{ config(materialized='table') }}` overrides the folder-level default for this single model.
+`{{ ref('stg_orders') }}` resolves to `ECOMM_DB.STAGING.STG_ORDERS` and registers a dependency.
+
 ### Step 2: Run all models
 
 ```bash
@@ -216,36 +206,29 @@ dbt run
 
 Expected output:
 ```
-1 of 2 START sql view model DBT_DEV.stg_orders .................. OK
-2 of 2 START sql table model DBT_DEV.orders_mart ................ OK
-Completed successfully.
+1 of 2 START sql view model STAGING.stg_orders .................. OK
+2 of 2 START sql table model MARTS.orders_mart .................. OK
 Done. PASS=2 WARN=0 ERROR=0 SKIP=0 TOTAL=2
 ```
 
-Observe: `stg_orders` runs before `orders_mart` — dbt resolved the dependency from `ref('stg_orders')`.
+`stg_orders` always runs before `orders_mart` — dbt resolves this automatically from the `ref()` call.
 
 ### Step 3: Verify in Snowsight
 
 ```sql
--- View should exist
-SHOW VIEWS IN SCHEMA ECOMM_DB.DBT_DEV;
--- Table should exist
-SHOW TABLES IN SCHEMA ECOMM_DB.DBT_DEV;
+SHOW VIEWS  IN SCHEMA ECOMM_DB.STAGING;
+SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
 
--- Query the mart
-SELECT * FROM ECOMM_DB.DBT_DEV.ORDERS_MART ORDER BY order_date;
+SELECT * FROM ECOMM_DB.MARTS.ORDERS_MART ORDER BY order_date;
 ```
 
 ### Step 4: Check what SQL dbt actually generated
 
 ```bash
-# dbt saves compiled SQL in target/compiled/
-cat target/compiled/ecomm_dbt/models/marts/orders_mart.sql
-# On Windows:
 type target\compiled\ecomm_dbt\models\marts\orders_mart.sql
 ```
 
-You will see the SELECT with `ref()` resolved to the actual schema-qualified table name.
+You will see the SELECT with `ref()` resolved to `ECOMM_DB.STAGING.STG_ORDERS`.
 
 ---
 
@@ -255,38 +238,39 @@ You will see the SELECT with `ref()` resolved to the actual schema-qualified tab
 
 ```bash
 dbt run --select staging.*
-# Only stg_orders runs
 ```
+
+Only `stg_orders` runs. `orders_mart` is not in the staging folder so it is skipped.
 
 ### Step 2: Run stg_orders and everything downstream
 
 ```bash
 dbt run --select stg_orders+
-# stg_orders runs, then orders_mart runs (because it depends on stg_orders)
 ```
+
+`stg_orders` runs first, then `orders_mart` runs (because it depends on `stg_orders`). The `+` means "and all descendants".
 
 ### Step 3: Simulate a source change
 
-Pretend the raw schema is renamed. Update `sources.yml` temporarily:
+Update `sources.yml` temporarily — change `schema: RAW_DATA` to `schema: RAW_DATA_V2`:
 
 ```yaml
-# Change schema from RAW_DATA to RAW_DATA_V2 (this will cause a failure)
 schema: RAW_DATA_V2
 ```
 
 Run:
 ```bash
 dbt run
-# Should fail — ECOMM_DB.RAW_DATA_V2.ORDERS_RAW does not exist
 ```
 
-Observe: `stg_orders` fails, `orders_mart` is marked `SKIP` — not `ERROR` — because dbt skips models whose upstream dependencies failed.
+`stg_orders` fails (table does not exist), `orders_mart` shows `SKIP` — not `ERROR`. dbt skips downstream models when their dependencies fail to prevent bad data from propagating.
 
 Revert `sources.yml` back to `RAW_DATA` and re-run:
 ```bash
 dbt run
-# Back to: PASS=2 WARN=0 ERROR=0 SKIP=0 TOTAL=2
 ```
+
+Expected: `PASS=2 WARN=0 ERROR=0 SKIP=0`
 
 ---
 
@@ -298,30 +282,30 @@ dbt run
 dbt docs generate
 ```
 
-This creates `target/catalog.json` with schema metadata for all models and sources.
+Reads all YAML files and queries Snowflake for column metadata. Writes `target/catalog.json`.
 
 ### Step 2: Serve the docs locally
 
 ```bash
 dbt docs serve
-# Opens browser at http://localhost:8080
 ```
 
+Opens browser at `http://localhost:8080`.
+
 Navigate to:
-- **Project** tab → see `stg_orders` and `orders_mart`
-- Click `orders_mart` → scroll to **Depends On** section → see `stg_orders` listed
-- Click the **Lineage Graph** button (bottom right) → see the DAG:
-  ```
-  ORDERS_RAW (source) → stg_orders → orders_mart
-  ```
+- **Project** tab → click `stg_orders` and `orders_mart`
+- Click `orders_mart` → **Depends On** section → `stg_orders` listed
+- Click the **Lineage Graph** button (bottom right):
+
+```
+ORDERS_RAW (source) → stg_orders → orders_mart
+```
 
 Stop the docs server with `Ctrl+C`.
 
 ---
 
 ## Exercise 6 — Add a Customer Summary Model
-
-Create a second mart model to reinforce `ref()` usage.
 
 Create `models/marts/customer_summary.sql`:
 
@@ -341,24 +325,22 @@ ORDER BY lifetime_value DESC
 ```
 
 Run and verify:
+
 ```bash
 dbt run
-
-# Expected: PASS=3 (stg_orders, orders_mart, customer_summary)
 ```
+
+Expected: `PASS=3 (stg_orders, orders_mart, customer_summary)`
 
 ```sql
--- Verify in Snowsight
-SELECT * FROM ECOMM_DB.DBT_DEV.CUSTOMER_SUMMARY ORDER BY lifetime_value DESC;
+SELECT * FROM ECOMM_DB.MARTS.CUSTOMER_SUMMARY ORDER BY lifetime_value DESC;
 ```
 
-Regenerate docs and check the lineage — both `orders_mart` and `customer_summary` should now appear as children of `stg_orders`.
+Regenerate docs and check the lineage — both `orders_mart` and `customer_summary` should appear as children of `stg_orders`.
 
 ---
 
 ## Final Project Structure
-
-After completing all exercises your project should look like this:
 
 ```
 ecomm_dbt/
@@ -372,9 +354,7 @@ ecomm_dbt/
 │       └── customer_summary.sql
 ├── macros/
 ├── seeds/
-├── tests/
-└── target/
-    └── compiled/   ← generated SQL (do not edit)
+└── tests/
 ```
 
 ---
@@ -384,8 +364,8 @@ ecomm_dbt/
 | Exercise | What you verified |
 |---|---|
 | 1 | dbt installed, project initialized, connection working (`dbt debug`) |
-| 2 | First staging model with `source()`, view materialization |
-| 3 | Mart model with `ref()`, table materialization, dependency ordering |
-| 4 | Selectors (`stg_orders+`, `staging.*`), behavior when upstream fails |
-| 5 | Lineage graph in `dbt docs serve`, DAG visualization |
-| 6 | Second mart model, both `orders_mart` and `customer_summary` depend on `stg_orders` |
+| 2 | Staging model with `source()`, view materialization, runs in `ECOMM_DB.STAGING` |
+| 3 | Mart model with `ref()`, table materialization, runs in `ECOMM_DB.MARTS`, dependency ordering |
+| 4 | Selectors (`stg_orders+`, `staging.*`), SKIP behavior when upstream fails |
+| 5 | Lineage graph in `dbt docs serve` |
+| 6 | Second mart model, both mart models depend on `stg_orders` |
