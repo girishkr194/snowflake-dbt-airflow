@@ -342,6 +342,60 @@ CREATE OR REPLACE VIEW ECOMM_DB.STAGING.STG_ORDERS AS (
 
 The schema (`STAGING`) comes from your `profiles.yml`. You wrote only the SELECT — dbt added the `CREATE OR REPLACE VIEW` wrapper automatically.
 
+### Troubleshooting — "Nothing to do" warning
+
+If you run `dbt run --select stg_orders` and see:
+
+```
+WARNING: Nothing to do. Try checking your model configs and model specification args.
+Done. PASS=0 WARN=1 ERROR=0 SKIP=0 TOTAL=0
+```
+
+This means dbt found **no models matching the name `stg_orders`**. The most common causes:
+
+**1. The file is not inside the `models/` directory**
+
+dbt only looks inside the path defined by `model-paths` in `dbt_project.yml` (defaults to `models/`). If `stg_orders.sql` is sitting at the project root or anywhere outside `models/`, dbt cannot see it.
+
+Fix — make sure the file is at:
+```
+ecomm_dbt/
+└── models/
+    └── staging/
+        └── stg_orders.sql   ← must be here
+```
+
+**2. You are running the command from the wrong directory**
+
+dbt must be run from the **project root** — the folder that contains `dbt_project.yml`.
+
+```bash
+# Wrong — running from outside the project
+dbt run --select stg_orders
+
+# Correct — cd into the project first
+cd ecomm_dbt
+dbt run --select stg_orders
+```
+
+**3. The filename does not match the selector**
+
+The `--select` flag matches the filename without the `.sql` extension. If your file is named `stg_order.sql` (missing the `s`) or `STG_ORDERS.sql`, the selector `stg_orders` won't match.
+
+Fix — rename the file to exactly `stg_orders.sql`.
+
+**4. The model is excluded in `dbt_project.yml`**
+
+If `dbt_project.yml` has an `+enabled: false` config for the staging folder, dbt skips those models entirely.
+
+**Quick check — run this to confirm dbt can see the model:**
+
+```bash
+dbt ls --select stg_orders
+```
+
+If it prints nothing, the file is missing or misplaced. If it prints `ecomm_dbt.stg_orders`, then the model is found and `dbt run --select stg_orders` will work.
+
 ### Run all models
 
 ```bash
