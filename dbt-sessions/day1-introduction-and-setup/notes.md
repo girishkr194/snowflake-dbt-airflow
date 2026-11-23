@@ -73,21 +73,121 @@ You write plain `SELECT` statements. dbt handles the `CREATE OR REPLACE` boilerp
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.8+ (3.11 recommended)
 - pip
 - Snowflake account with `ECOMM_DB` already created (from the Snowflake module)
 
-### Install dbt Core + Snowflake adapter
+---
+
+### macOS Setup
+
+**Step 1 — Install Python via Homebrew (if not already installed)**
 
 ```bash
+brew install python@3.11
+```
+
+Verify:
+
+```bash
+python3 --version
+```
+
+**Step 2 — Create and activate a virtual environment**
+
+Always install dbt inside a virtual environment to avoid dependency conflicts with other Python projects.
+
+```bash
+python3 -m venv dbt-env
+source dbt-env/bin/activate
+```
+
+Your prompt will change to show `(dbt-env)` — this means the virtual environment is active.
+
+**Step 3 — Upgrade pip and install dbt-snowflake**
+
+```bash
+pip install --upgrade pip
 pip install dbt-snowflake
 ```
+
+**Step 4 — Verify installation**
 
 ```bash
 dbt --version
 ```
 
-This installs two packages: `dbt-core` (the dbt engine) and `dbt-snowflake` (the Snowflake adapter that translates dbt commands into Snowflake SQL).
+**Step 5 — (Optional) Install git if not present**
+
+```bash
+brew install git
+```
+
+**Notes for macOS:**
+- If you use `zsh` (default on macOS Ventura+), add `source dbt-env/bin/activate` to `~/.zshrc` to auto-activate the env in new terminals.
+- Apple Silicon (M1/M2/M3) users: Homebrew installs under `/opt/homebrew/`. Make sure `/opt/homebrew/bin` is in your `PATH`.
+- To deactivate the virtual environment: `deactivate`
+
+---
+
+### Ubuntu / Linux Setup
+
+**Step 1 — Install Python and pip**
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv
+```
+
+Verify:
+
+```bash
+python3 --version
+pip3 --version
+```
+
+**Step 2 — Install system-level build dependencies**
+
+Some dbt adapters require compiled C extensions. Install these before `pip install`:
+
+```bash
+sudo apt install -y build-essential libssl-dev libffi-dev python3-dev
+```
+
+**Step 3 — Create and activate a virtual environment**
+
+```bash
+python3 -m venv dbt-env
+source dbt-env/bin/activate
+```
+
+Your prompt will show `(dbt-env)` when the environment is active.
+
+**Step 4 — Upgrade pip and install dbt-snowflake**
+
+```bash
+pip install --upgrade pip
+pip install dbt-snowflake
+```
+
+**Step 5 — Verify installation**
+
+```bash
+dbt --version
+```
+
+**Notes for Ubuntu:**
+- Always use a virtual environment — installing dbt system-wide with `sudo pip` can break system Python packages.
+- To make the env persistent across terminal sessions, add `source ~/dbt-env/bin/activate` to `~/.bashrc`.
+- To deactivate the virtual environment: `deactivate`
+
+---
+
+### What Gets Installed
+
+`pip install dbt-snowflake` installs two packages:
+- `dbt-core` — the dbt engine (DAG runner, Jinja compiler, test runner)
+- `dbt-snowflake` — the Snowflake adapter that translates dbt commands into Snowflake-flavored SQL
 
 ---
 
@@ -378,6 +478,14 @@ SELECT ...
 ## Hands-On Summary
 
 ```bash
+# macOS
+python3 -m venv dbt-env && source dbt-env/bin/activate
+
+# Ubuntu
+python3 -m venv dbt-env && source dbt-env/bin/activate
+
+# Both platforms (after activating the venv)
+pip install --upgrade pip
 pip install dbt-snowflake
 dbt init ecomm_dbt
 cd ecomm_dbt
