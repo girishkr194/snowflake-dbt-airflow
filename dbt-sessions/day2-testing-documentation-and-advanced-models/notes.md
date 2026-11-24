@@ -7,10 +7,11 @@
 3. **Sources with freshness** — Properly declare raw tables, check if source data is stale
 4. **Schema YAML** — Describe every column, attach tests in a `.yml` file
 5. **Built-in tests** — `not_null`, `unique`, `accepted_values`, `relationships`
-6. **`dbt test`** — Run all tests, understand pass/fail output
-7. **Incremental models** — Only process new rows instead of rebuilding the full table
-8. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
-9. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
+6. **Intentionally breaking tests** — INSERT bad data for every test type, observe failures, DELETE and restore
+7. **`dbt test`** — Run all tests, understand pass/fail output
+8. **Incremental models** — Only process new rows instead of rebuilding the full table
+9. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
+10. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
 
 > **Starting point:** The `ecomm_dbt` project from Day 1 with `stg_orders.sql` running.
 > Today we improve it: add dynamic schema routing, sources, descriptions, tests, and an incremental model.
@@ -495,7 +496,224 @@ Use on: foreign key columns to verify referential integrity between models.
 
 ---
 
-## Concept 5 — Running Tests
+## Concept 5 — Intentionally Breaking Tests (Hands-On)
+
+This section gives you INSERT queries to inject bad data into `ORDERS_RAW`, run `dbt test` to see the failure, then DELETE the bad rows to restore clean state.
+
+The flow for each scenario:
+1. INSERT bad row into `ECOMM_DB.RAW_DATA.ORDERS_RAW`
+2. `dbt run --select stg_orders` — rebuild the view so it picks up the new row
+3. `dbt test --select stg_orders` — observe the FAIL
+4. DELETE the bad row from `ORDERS_RAW`
+5. `dbt run --select stg_orders` — rebuild again to remove the bad row from the view
+6. `dbt test --select stg_orders` — confirm back to PASS
+
+---
+
+### Scenario 1 — Break `not_null` on `order_id`
+
+**What we expect:** `test not_null_stg_orders_order_id` FAILS
+
+```sql
+-- INSERT: a row with NULL order_id
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES
+    (NULL, 999, 'Test User', 'Widget', 1, 10.00, 10.00, 'CONFIRMED', '2024-01-01', CURRENT_TIMESTAMP());
+```
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected failure output:
+```
+FAIL 1  test not_null_stg_orders_order_id
+```
+
+```sql
+-- CLEANUP: remove the bad row
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id IS NULL;
+```
+
+---
+
+### Scenario 2 — Break `unique` on `order_id`
+
+**What we expect:** `test unique_stg_orders_order_id` FAILS
+
+```sql
+-- INSERT: duplicate order_id (use an order_id that already exists in your table, e.g. 1)
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES
+    (1, 999, 'Duplicate User', 'Widget', 1, 10.00, 10.00, 'CONFIRMED', '2024-01-01', CURRENT_TIMESTAMP());
+```
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected failure output:
+```
+FAIL 1  test unique_stg_orders_order_id
+```
+
+```sql
+-- CLEANUP: remove the duplicate (keeps the original order_id=1, deletes only the one with customer_name='Duplicate User')
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id = 1
+  AND customer_name = 'Duplicate User';
+```
+
+---
+
+### Scenario 3 — Break `accepted_values` on `status`
+
+**What we expect:** `test accepted_values_stg_orders_status__CONFIRMED__SHIPPED__DELIVERED__CANCELLED` FAILS
+
+```sql
+-- INSERT: a status value that is NOT in the allowed list
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES
+    (99901, 999, 'Test User', 'Widget', 1, 10.00, 10.00, 'PENDING', '2024-01-01', CURRENT_TIMESTAMP());
+```
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected failure output:
+```
+FAIL 1  test accepted_values_stg_orders_status__CONFIRMED__SHIPPED__DELIVERED__CANCELLED
+```
+
+```sql
+-- CLEANUP
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id = 99901;
+```
+
+**Other invalid values you can try** — each will cause the same test to fail:
+
+```sql
+-- 'RETURNED' — not in list
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES (99902, 999, 'Test User', 'Widget', 1, 10.00, 10.00, 'RETURNED', '2024-01-01', CURRENT_TIMESTAMP());
+
+-- 'confirmed' — lowercase, dbt's accepted_values is case-sensitive by default
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES (99903, 999, 'Test User', 'Widget', 1, 10.00, 10.00, 'confirmed', '2024-01-01', CURRENT_TIMESTAMP());
+
+-- NULL status — breaks both not_null AND accepted_values at once
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES (99904, 999, 'Test User', 'Widget', 1, 10.00, 10.00, NULL, '2024-01-01', CURRENT_TIMESTAMP());
+```
+
+```sql
+-- CLEANUP all three
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id IN (99902, 99903, 99904);
+```
+
+---
+
+### Scenario 4 — Break `not_null` on `customer_name`
+
+**What we expect:** `test not_null_stg_orders_customer_name` FAILS
+
+```sql
+-- INSERT: valid order_id but NULL customer_name
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES
+    (99905, 101, NULL, 'Widget', 2, 25.00, 50.00, 'SHIPPED', '2024-01-02', CURRENT_TIMESTAMP());
+```
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected failure output:
+```
+FAIL 1  test not_null_stg_orders_customer_name
+```
+
+```sql
+-- CLEANUP
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id = 99905;
+```
+
+---
+
+### Scenario 5 — Break multiple tests at once
+
+**What we expect:** multiple tests FAIL in a single `dbt test` run
+
+```sql
+-- INSERT three bad rows at once — covers not_null, unique, accepted_values
+INSERT INTO ECOMM_DB.RAW_DATA.ORDERS_RAW
+    (order_id, customer_id, customer_name, product, quantity, unit_price, total_amount, status, order_date, updated_at)
+VALUES
+    (NULL,  888, 'Bad Row A', 'Widget', 1, 5.00, 5.00, 'CONFIRMED', '2024-01-03', CURRENT_TIMESTAMP()),  -- breaks not_null on order_id
+    (1,     888, 'Bad Row B', 'Widget', 1, 5.00, 5.00, 'CONFIRMED', '2024-01-03', CURRENT_TIMESTAMP()),  -- breaks unique on order_id (duplicate of existing id=1)
+    (99906, 888, 'Bad Row C', 'Widget', 1, 5.00, 5.00, 'INVALID',   '2024-01-03', CURRENT_TIMESTAMP()); -- breaks accepted_values on status
+```
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected failure output:
+```
+FAIL 1  test not_null_stg_orders_order_id
+FAIL 1  test unique_stg_orders_order_id
+FAIL 1  test accepted_values_stg_orders_status__CONFIRMED__SHIPPED__DELIVERED__CANCELLED
+Done. PASS=6 WARN=0 ERROR=0 FAIL=3 SKIP=0 TOTAL=9
+```
+
+```sql
+-- CLEANUP all three bad rows
+DELETE FROM ECOMM_DB.RAW_DATA.ORDERS_RAW
+WHERE order_id IS NULL
+   OR (order_id = 1 AND customer_name = 'Bad Row B')
+   OR order_id = 99906;
+```
+
+---
+
+### After every cleanup — verify tests are green again
+
+```bash
+dbt run --select stg_orders
+dbt test --select stg_orders
+```
+
+Expected clean output:
+```
+Done. PASS=9 WARN=0 ERROR=0 FAIL=0 SKIP=0 TOTAL=9
+```
+
+---
+
+### Why insert into `ORDERS_RAW` and not directly into `STG_ORDERS`?
+
+`STG_ORDERS` is a **view** — it has no data of its own. It is defined as `SELECT ... FROM ORDERS_RAW`. Every time dbt tests query `STG_ORDERS`, Snowflake executes the view's SQL live against `ORDERS_RAW`. So bad data must be inserted into the **source table** (`ORDERS_RAW`) to show up in the view and be caught by the tests.
+
+---
+
+## Concept 6 — Running dbt Tests
 
 ```bash
 dbt test
@@ -539,7 +757,7 @@ Once found, trace back to `ORDERS_RAW` to decide: fix the source data (EL pipeli
 
 ---
 
-## Concept 6 — Incremental Models
+## Concept 7 — Incremental Models
 
 ### Why incremental?
 
@@ -620,7 +838,7 @@ dbt run --select stg_orders_incremental --full-refresh
 
 ---
 
-## Concept 7 — Jinja Templating Basics
+## Concept 8 — Jinja Templating Basics
 
 dbt uses **Jinja** — a Python templating language — inside SQL files. Everything between `{{ }}` or `{% %}` is Jinja that dbt evaluates before sending SQL to Snowflake.
 
@@ -650,7 +868,7 @@ Inside an incremental model, `{{ this }}` resolves to the existing target table.
 
 ---
 
-## Concept 8 — Model Documentation
+## Concept 9 — Model Documentation
 
 ### Add descriptions to the mart model
 
