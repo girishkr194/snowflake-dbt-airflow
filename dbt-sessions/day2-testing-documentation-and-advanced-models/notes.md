@@ -3,13 +3,14 @@
 ## What You Will Learn
 
 1. **Dynamic schema routing** — Write staging models to `STAGING`, mart models to `MARTS` — automatically, without changing `profiles.yml`
-2. **Sources with freshness** — Properly declare raw tables, check if source data is stale
-3. **Schema YAML** — Describe every column, attach tests in a `.yml` file
-4. **Built-in tests** — `not_null`, `unique`, `accepted_values`, `relationships`
-5. **`dbt test`** — Run all tests, understand pass/fail output
-6. **Incremental models** — Only process new rows instead of rebuilding the full table
-7. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
-8. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
+2. **`sources.yml` vs `schema.yml`** — What each file is for, what the top-level keys mean, and why the filename doesn't matter
+3. **Sources with freshness** — Properly declare raw tables, check if source data is stale
+4. **Schema YAML** — Describe every column, attach tests in a `.yml` file
+5. **Built-in tests** — `not_null`, `unique`, `accepted_values`, `relationships`
+6. **`dbt test`** — Run all tests, understand pass/fail output
+7. **Incremental models** — Only process new rows instead of rebuilding the full table
+8. **Model documentation** — `description` fields, `dbt docs generate`, lineage graph
+9. **Jinja basics** — `{{ config() }}`, `{{ ref() }}`, `{{ source() }}`, `{% if %}` explained
 
 > **Starting point:** The `ecomm_dbt` project from Day 1 with `stg_orders.sql` running.
 > Today we improve it: add dynamic schema routing, sources, descriptions, tests, and an incremental model.
@@ -133,7 +134,65 @@ SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
 
 ---
 
-## Concept 1 — Sources (the right way)
+## Concept 1 — `sources.yml` vs `schema.yml` — What's the Difference?
+
+Both are YAML files that live inside `models/`. They look similar but serve completely different purposes.
+
+### File naming — can you use any name?
+
+| File | Fixed name? |
+|---|---|
+| `sources.yml` | **No** — you can name it anything (`raw_sources.yml`, `my_sources.yml`). dbt identifies it by the `sources:` key inside it, not the filename. |
+| `schema.yml` | **No** — same rule. You can name it `stg_orders.yml`, `models.yml`, anything. dbt identifies it by the `models:` key inside it. |
+
+The names `sources.yml` and `schema.yml` are just **conventions** the community follows. dbt does not care about the filename — it scans all `.yml` files in `model-paths` and reads whatever top-level keys (`sources:`, `models:`) it finds.
+
+### What each file is for
+
+| | `sources.yml` | `schema.yml` |
+|---|---|---|
+| **What it covers** | Tables dbt did **not** create — raw tables loaded by Fivetran, Airbyte, Snowpipe, etc. | Models dbt **did** create — your `.sql` files |
+| **Top-level key** | `sources:` | `models:` |
+| **Unlocks** | `{{ source('raw_data', 'orders_raw') }}` macro in SQL | `dbt test` and `dbt docs` for your models |
+| **Freshness checks** | Yes — `dbt source freshness` checks MAX(updated_at) | No |
+| **Tests** | Column-level tests on source tables | Column-level tests on dbt models |
+| **Lineage graph** | Shows as a **green source node** | Shows as a **blue model node** |
+
+### Side-by-side example
+
+```yaml
+# sources.yml  — declares ORDERS_RAW which dbt did NOT build
+version: 2
+sources:
+  - name: raw_data              # logical name used in {{ source() }}
+    database: ECOMM_DB
+    schema: RAW_DATA
+    tables:
+      - name: orders_raw        # actual Snowflake table name
+```
+
+```yaml
+# schema.yml  — documents STG_ORDERS which dbt DID build
+version: 2
+models:
+  - name: stg_orders            # must match stg_orders.sql filename exactly
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+```
+
+### One-line rule
+
+> `sources.yml` = "here is data I did not create, tell dbt where to find it"
+> `schema.yml` = "here is data dbt created, add tests and descriptions to it"
+
+A common pattern is to have **both files in the same folder** (`models/staging/`) — `sources.yml` declares the raw input, `schema.yml` tests and documents the staging output that was built from it.
+
+---
+
+## Concept 2 — Sources (the right way)
 
 ### What we have today
 
@@ -242,7 +301,7 @@ If you see WARN or ERROR, it means `ORDERS_RAW.updated_at` has not been updated 
 
 ---
 
-## Concept 2 — Schema YAML: Describing and Testing Models
+## Concept 3 — Schema YAML: Describing and Testing Models
 
 ### What is schema.yml?
 
@@ -329,7 +388,7 @@ models:
 
 ---
 
-## Concept 3 — The Four Built-in dbt Tests
+## Concept 4 — The Four Built-in dbt Tests
 
 dbt ships with four generic tests you can attach to any column in any YAML file — no SQL required.
 
@@ -436,7 +495,7 @@ Use on: foreign key columns to verify referential integrity between models.
 
 ---
 
-## Concept 4 — Running Tests
+## Concept 5 — Running Tests
 
 ```bash
 dbt test
@@ -480,7 +539,7 @@ Once found, trace back to `ORDERS_RAW` to decide: fix the source data (EL pipeli
 
 ---
 
-## Concept 5 — Incremental Models
+## Concept 6 — Incremental Models
 
 ### Why incremental?
 
@@ -561,7 +620,7 @@ dbt run --select stg_orders_incremental --full-refresh
 
 ---
 
-## Concept 6 — Jinja Templating Basics
+## Concept 7 — Jinja Templating Basics
 
 dbt uses **Jinja** — a Python templating language — inside SQL files. Everything between `{{ }}` or `{% %}` is Jinja that dbt evaluates before sending SQL to Snowflake.
 
@@ -591,7 +650,7 @@ Inside an incremental model, `{{ this }}` resolves to the existing target table.
 
 ---
 
-## Concept 7 — Model Documentation
+## Concept 8 — Model Documentation
 
 ### Add descriptions to the mart model
 
